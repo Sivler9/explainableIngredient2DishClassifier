@@ -1,8 +1,8 @@
-import math
-import os.path
-import random
 import time
 import copy
+import math
+import random
+import os.path
 
 import numpy as np
 import torch.optim
@@ -36,7 +36,7 @@ class ExplanetModel(nn.Module):
         self.best_d, self.best_c = None, None
         self.ds_t, self.ds_v = train_data, valid_data
         # base_prob = 1./len(train_data.class_list)  # .5 np.nan .5 np.nan base_prob np.nan base_prob np.nan
-        self.history = {'bin_acc': [], 'loss_dt': [], 'bin_acc_v': [], 'loss_dv': [],
+        self.history = {'bin_acc': [], 'loss_dt': [], 'bin_acc_v': [], 'loss_dv': [],  # TODO - explicability
                         'cat_acc': [], 'loss_ct': [], 'cat_acc_v': [], 'loss_cv': [], 'shap_ged': []}
         if isinstance(backbone, models.Inception3):
             # Based on: https://github.com/ivanDonadello/Food-Categories-Classification
@@ -68,11 +68,12 @@ class ExplanetModel(nn.Module):
             self.criterion_d = nn.BCELoss()
 
         self.detection_threshold = torch.tensor([.5]).to(self.device)
-        if box_convert not in ['probabilities', 'detections', 'box']:  # TODO - Use probabilities or detections?
+        # TODO - Use probabilities or detections?
+        if box_convert and box_convert not in ['probabilities', 'detections', 'box']:
             self.detect_convert = box_convert
         elif box_convert == 'box':
             def box_scores_to_array(x):
-                return x
+                return x  # TODO
             self.detect_convert = box_scores_to_array
         elif box_convert == 'detections':
             self.detect_convert = lambda x: torch.gt(x.detach(), self.detection_threshold).float()
@@ -104,21 +105,20 @@ class ExplanetModel(nn.Module):
         # criterion_c = lambda x, y, z: test_c(x, y)
 
         self.train()
-        num_dt, out_dt = 0, []
-        loss_dt, loss_ct, acc_dt = 0., 0., 0.
-        for imgs_d, (targets_d, _) in data:
+        out_dt, num_dt, loss_dt, loss_ct, acc_dt = [], 0, 0., 0., 0.
+        for imgs_d, (targets_d, _) in data:  # TODO - bbox version
             num_dt += len(imgs_d)
             self.optimizer_d.zero_grad()
 
             output_d = self.detector(imgs_d)
-            if isinstance(output_d, models.InceptionOutputs):
+            if isinstance(output_d, models.InceptionOutputs):  # TODO - more exceptions
                 output_d = output_d.logits
             loss_d = self.criterion_d(output_d, targets_d)  # [0]
             loss_d.backward()
             self.optimizer_d.step()
 
             acc_dt += torch.sum(binary_accuracy(output_d, targets_d, self.detection_threshold)).item()
-            out_dt.append(self.detect_convert(output_d))
+            out_dt.append(self.detect_convert(output_d.detach()))
             loss_dt += loss_d.item()
 
         acc_ct = 0.
@@ -137,10 +137,8 @@ class ExplanetModel(nn.Module):
             if ep >= epochs_c - 1:
                 acc_ct = acc
 
-        num_dv = 0
         self.eval()
-        acc_dv, acc_cv = 0., 0.
-        loss_dv, loss_cv = 0., 0.
+        num_dv, acc_dv, acc_cv, loss_dv, loss_cv = 0, 0., 0., 0., 0.
         with torch.no_grad():
             for imgs_v, targets_v in valid:
                 num_dv += len(imgs_v)
@@ -164,7 +162,7 @@ class ExplanetModel(nn.Module):
         self.history['loss_dt'].append(loss_dt / num_dt)
         self.history['loss_ct'].append(loss_ct / num_dt)
 
-    def train_model(self, epochs=50, batch_size=8):
+    def train_model(self, epochs=50, batch_size=8, bboxes=False):  # TODO - bbox version
         # t_data = DataLoader(self.ds_t, batch_size=batch_size, collate_fn=lambda batch: tuple(zip(*batch)))
         # v_data = DataLoader(self.ds_v, batch_size=batch_size, collate_fn=lambda batch: tuple(zip(*batch)))
         tc_data = DataLoader(self.ds_t.classify, batch_size=batch_size)
@@ -176,7 +174,7 @@ class ExplanetModel(nn.Module):
                 self.scheduler_d.step()
             print(f'\nEpoch {ep + 1:03d}/{epochs:03d}'
                   f' (bin_acc = {self.history["bin_acc"][-1]}'
-                  f', cat_acc = {self.history["cat_acc"][-1]})', end='')
+                  f', cat_acc = {self.history["cat_acc"][-1]})', end='')  # TODO - shap_ged
         print('\nFinished')
         return self.history
 
@@ -256,7 +254,7 @@ def main():
 
     # backbones = [mobilenet_v2(pretrained=True), resnet50(pretrained=True)]
     db = 'FFoCat_reduced'  # FFoCat MonuMAI PASCAL
-    use_boxes = True
+    use_boxes = False
     if 'FFoCat' in db:
         img_size, backbone = 299, models.inception_v3(pretrained=True)
     elif use_boxes:
@@ -273,13 +271,13 @@ def main():
     # visualize_img_bbox(data_train, img_idx)
 
     box_convert = None
-    if use_boxes and not db == 'FFoCat':
+    if use_boxes and 'FFoCat' not in db:
         box_convert = 'box'
         in_features = backbone.roi_heads.box_predictor.cls_score.in_features
         backbone.roi_heads.box_predictor = FastRCNNPredictor(in_features, len(data_train.part_list))
 
     model = ExplanetModel(data_train, data_valid, backbone=backbone, box_convert=box_convert)
-    hist = model.train_model(epochs=5)
+    hist = model.train_model(epochs=50)
     print(pd.DataFrame(hist).T)
     for k, v in hist.items():
         plt.plot(v, label=k)
@@ -287,7 +285,7 @@ def main():
     plt.legend()
     plt.show()
 
-    torch.save(model, f'./results/{fecha}/{backbone.__name__}.pth')
+    torch.save(model, f'./results/{fecha}/{backbone.__name__}.pth')  # TODO - .state_dict()
     # exit(0)
 
 

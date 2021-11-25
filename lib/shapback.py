@@ -63,6 +63,7 @@ class ShapBackLoss(nn.CrossEntropyLoss):
             shap_values = self.explainer.shap_values(elems)
             shap_contrib = self.compare_shap_and_kg(shap_values, target, self.data_train.part_list)
             shap_coeff = reduce_shap(shap_contrib, device=self.device)
+            # TODO - GED metric
         else:
             shap_coeff = torch.ones((len(y_pred), ), device=self.device)
 
