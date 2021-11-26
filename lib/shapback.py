@@ -33,6 +33,52 @@ def kg_from_dict(dic_s, feat, style_s):
     return knowledge_graph
 
 
+def GED_metric(features, shap_values, threshold=0.001, dataset='MonumenAI'):
+    """TODO - documentation
+    Fully compute the GED, given feature vectors and shap values. Build KG, build SAG and compute GED"""
+    raise NotImplementedError()  # TODO - Adapt
+
+    names = names_monumenai
+    element_dic = element_dic_monumenai
+    styles = styles_monumenai
+
+    KG, index_dic, reversed_index_dic = make_KG(False,dataset=dataset)
+    d_tot = 0
+    shap_array = np.dstack((shap_values[0],shap_values[1],shap_values[2],shap_values[3]))
+    features[features < 1] = 0
+    for i in range(len(shap_array)):
+        FG = nx.Graph()
+        for k in range(shap_array.shape[-1]):
+            facade = np.copy(shap_array[i,:,k])*features[k]
+            facade[facade<threshold] = 0
+            facade[facade>=threshold] = 1
+            facade = facade.astype(np.uint8)
+            style_index = reversed_index_dic[styles[k]]
+            if np.sum(facade) > 0:
+                FG.add_node(style_index, name=styles[k])
+                for j in range(len(facade)):
+                    if facade[j]:
+                        index = reversed_index_dic[names[j]]
+                        FG.add_node(index, name=names[j])
+                        FG.add_edge(style_index, index)
+            facade = np.copy(shap_array[i,:,k])*(features[k] == False)
+            facade[facade<threshold] = 1  # TODO - Report bug to original repo
+            facade[facade>=threshold] = 0
+            facade = facade.astype(np.uint8)
+            style_index = reversed_index_dic[styles[k]]
+            if np.sum(facade) > 0:
+                FG.add_node(style_index, name=styles[k])
+                for j in range(len(facade)):
+                    if facade[j]:
+                        index = reversed_index_dic[names[j]]
+                        FG.add_node(index, name=names[j])
+                        FG.add_edge(style_index, index)
+        sub_KG = filter_KG(KG,FG)
+        d = distance(sub_KG, FG)
+        d_tot += d
+    return float(d_tot)/len(shap_array)
+
+
 class ShapBackLoss(nn.CrossEntropyLoss):
     """TODO - docs"""
     def __init__(self, dataset, data_train, classificator, device=torch.device('cpu')):

@@ -165,7 +165,7 @@ class ShapImageDataset(Dataset):
             augs = [self.tf(image=image_f[i][1], bboxes=boxes[i], parts=parts[i]) for i in range(len(image_f))]
 
             classes = torch.LongTensor([self.class_list.index(clases[i]) for i in range(len(augs))])
-            parts = torch.LongTensor(self.mlb.fit_transform([[p for p in a['parts']] for a in augs]))
+            parts = torch.LongTensor(self.mlb.fit_transform([[p for p in a['parts']] for a in augs]))  # TODO - count
             image = torch.stack([a['image'] for a in augs])
 
             # classes = F.one_hot(classes, num_classes=len(self.classes))
@@ -181,7 +181,7 @@ class ShapImageDataset(Dataset):
             target = {
                 'labels': torch.LongTensor([self.part_list.index(p) for p in parts], device=self.device),
                 'class': torch.LongTensor([self.class_list.index(clas)], device=self.device),
-                # 'iscrowd': torch.zeros((len(parts),), dtype=torch.int64, device=self.device), 'masks': None,
+                'iscrowd': torch.zeros((len(parts),), dtype=torch.int64, device=self.device),  # 'masks': None,
                 'area': area.to(self.device), 'boxes': boxes.to(self.device),
                 'image_id': torch.LongTensor([idx], device=self.device),
                 'file_name': image_f[:1],

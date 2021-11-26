@@ -32,11 +32,12 @@ def binary_accuracy(y_pred: torch.Tensor, y_true: torch.Tensor,
 class ExplanetModel(nn.Module):
     def __init__(self, train_data, valid_data, backbone=None, box_convert=None, device=DEFAULT_DEVICE):
         super().__init__()
+        self.mode = False
         self.device = device
         self.best_d, self.best_c = None, None
         self.ds_t, self.ds_v = train_data, valid_data
         # base_prob = 1./len(train_data.class_list)  # .5 np.nan .5 np.nan base_prob np.nan base_prob np.nan
-        self.history = {'bin_acc': [], 'loss_dt': [], 'bin_acc_v': [], 'loss_dv': [],  # TODO - explicability
+        self.history = {'bin_acc': [], 'loss_dt': [], 'bin_acc_v': [], 'loss_dv': [],  # TODO - explicability, bbox
                         'cat_acc': [], 'loss_ct': [], 'cat_acc_v': [], 'loss_cv': [], 'shap_ged': []}
         if isinstance(backbone, models.Inception3):
             # Based on: https://github.com/ivanDonadello/Food-Categories-Classification
@@ -47,7 +48,7 @@ class ExplanetModel(nn.Module):
                 nn.Linear(2048, 2048), nn.ReLU(),
                 nn.Dropout(p=.5),                           # Moved here from inception_v3 output
                 nn.Linear(2048, len(self.ds_t.part_list)),
-                # nn.Sigmoid(),                               # Included in nn.BCEWithLogitsLoss()
+                nn.Sigmoid(),                               # Included in nn.BCEWithLogitsLoss()
             );  self.detector.to(self.device)
 
             self.optimizer_d = torch.optim.Adam(self.detector.parameters())
@@ -57,7 +58,7 @@ class ExplanetModel(nn.Module):
             self.detector = backbone if backbone else models.resnet50(pretrained=True)
             self.detector.fc = nn.Sequential(
                 nn.Linear(2048, len(self.ds_t.part_list)),
-                # nn.Sigmoid()  # Included in nn.BCEWithLogitsLoss()
+                nn.Sigmoid(),                               # Included in nn.BCEWithLogitsLoss()
             );  self.detector.to(self.device)
 
             self.optimizer_d = torch.optim.SGD(self.detector.parameters(), lr=.0003, momentum=.9)
@@ -68,27 +69,33 @@ class ExplanetModel(nn.Module):
             self.criterion_d = nn.BCELoss()
 
         self.detection_threshold = torch.tensor([.5]).to(self.device)
-        # TODO - Use probabilities or detections?
-        if box_convert and box_convert not in ['probabilities', 'detections', 'box']:
-            self.detect_convert = box_convert
-        elif box_convert == 'box':
-            def box_scores_to_array(x):
-                return x  # TODO
+        if box_convert == 'box':
+            def box_scores_to_array(x: dict, dataset=train_data):
+                """TODO - documentation
+                Add scores per object part"""
+                agg = [0.]*len(dataset.part_list)
+                for i, l in enumerate(x['labels'].detach().cpu().numpy()):
+                    agg[l] += x['scores'][i].item()
+                return torch.tensor(agg, dtype=torch.float)
             self.detect_convert = box_scores_to_array
         elif box_convert == 'detections':
             self.detect_convert = lambda x: torch.gt(x.detach(), self.detection_threshold).float()
-        else:  # Probabilities
-            self.detect_convert = lambda x: x
-
+        elif box_convert and box_convert != 'probabilities':
+            self.detect_convert = box_convert
+        else:  # if box_convert == :  # Probabilities or raw output
+            self.detect_convert = lambda x: x.detach().float()
         self.classifier = None
 
     def forward(self, x: torch.Tensor):
         assert self.classifier is not None
         dtc = self.best_d if self.best_d else self.detector
         cls = self.best_c if self.best_c else self.classifier
-        return cls(dtc(x))
+
+        self.train(self.mode)
+        return cls(self.detect_convert(dtc(x)))
 
     def train(self, mode: bool = True):
+        self.mode = mode
         self.detector.train(mode)
         if self.classifier:
             self.classifier.train(mode)
@@ -105,13 +112,13 @@ class ExplanetModel(nn.Module):
         # criterion_c = lambda x, y, z: test_c(x, y)
 
         self.train()
-        out_dt, num_dt, loss_dt, loss_ct, acc_dt = [], 0, 0., 0., 0.
-        for imgs_d, (targets_d, _) in data:  # TODO - bbox version
-            num_dt += len(imgs_d)
+        out_dt, num_t, loss_dt, loss_ct, acc_dt = [], 0, 0., 0., 0.
+        for imgs_d, (targets_d, _) in data:
+            num_t += len(imgs_d)
             self.optimizer_d.zero_grad()
 
             output_d = self.detector(imgs_d)
-            if isinstance(output_d, models.InceptionOutputs):  # TODO - more exceptions
+            if isinstance(output_d, models.InceptionOutputs):  # more exceptions
                 output_d = output_d.logits
             loss_d = self.criterion_d(output_d, targets_d)  # [0]
             loss_d.backward()
@@ -120,7 +127,6 @@ class ExplanetModel(nn.Module):
             acc_dt += torch.sum(binary_accuracy(output_d, targets_d, self.detection_threshold)).item()
             out_dt.append(self.detect_convert(output_d.detach()))
             loss_dt += loss_d.item()
-
         acc_ct = 0.
         for ep in range(epochs_c):
             loss_ct, acc = 0., 0.
@@ -136,12 +142,16 @@ class ExplanetModel(nn.Module):
                 acc += torch.sum(categorical_accuracy(output_c, targets_d)).item()
             if ep >= epochs_c - 1:
                 acc_ct = acc
+        self.history['bin_acc'].append(acc_dt / num_t)
+        self.history['cat_acc'].append(acc_ct / num_t)
+        self.history['loss_dt'].append(loss_dt / num_t)
+        self.history['loss_ct'].append(loss_ct / num_t)
 
         self.eval()
-        num_dv, acc_dv, acc_cv, loss_dv, loss_cv = 0, 0., 0., 0., 0.
+        num_v, acc_dv, acc_cv, loss_dv, loss_cv = 0, 0., 0., 0., 0.
         with torch.no_grad():
             for imgs_v, targets_v in valid:
-                num_dv += len(imgs_v)
+                num_v += len(imgs_v)
                 output_dv = self.detector(imgs_v)
                 output_cv = self.classifier(output_dv)
                 loss_dv += self.criterion_d(output_dv, targets_v[0]).item()
@@ -149,22 +159,88 @@ class ExplanetModel(nn.Module):
                 acc_dv += torch.sum(binary_accuracy(output_dv, targets_v[0], self.detection_threshold)).item()
                 acc_cv += torch.sum(categorical_accuracy(output_cv, targets_v[1])).item()
             if self.history['bin_acc_v']:  # TODO - torch.save()
-                if self.history['bin_acc_v'][-1] < acc_dv / num_dv:
+                if self.history['bin_acc_v'][-1] < acc_dv / num_v:
                     self.best_d = self.detector.cpu().state_dict()
-                if self.history['cat_acc_v'][-1] < acc_cv / num_dv:
+                if self.history['cat_acc_v'][-1] < acc_cv / num_v:
                     self.best_c = self.classifier.cpu().state_dict()
-        self.history['bin_acc_v'].append(acc_dv / num_dv)
-        self.history['cat_acc_v'].append(acc_cv / num_dv)
-        self.history['loss_dv'].append(loss_dv / num_dv)
-        self.history['loss_cv'].append(loss_cv / num_dv)
-        self.history['bin_acc'].append(acc_dt / num_dt)
-        self.history['cat_acc'].append(acc_ct / num_dt)
-        self.history['loss_dt'].append(loss_dt / num_dt)
-        self.history['loss_ct'].append(loss_ct / num_dt)
+        self.history['bin_acc_v'].append(acc_dv / num_v)
+        self.history['cat_acc_v'].append(acc_cv / num_v)
+        self.history['loss_dv'].append(loss_dv / num_v)
+        self.history['loss_cv'].append(loss_cv / num_v)
+
+
+    def train_one_epoch_bbox(self, data_d, valid_d, data_c, valid_c, epochs_c=25, classifier_neurons=11):
+        raise NotImplementedError()  # TODO - bbox version
+
+        self.classifier = nn.Sequential(
+            nn.Linear(len(data_d.dataset.part_list), classifier_neurons), nn.ReLU(),
+            nn.Linear(classifier_neurons, len(data_d.dataset.class_list)), nn.Softmax(dim=-1)
+        );  self.classifier.to(self.device)  #
+        optimizer_c = torch.optim.Adam(self.classifier.parameters())
+        criterion_c = ShapBackLoss(data_d.dataset, data_d.dataset[:][1][0], self.classifier, self.device)  # TODO
+        # test_c = nn.CrossEntropyLoss()
+        # criterion_c = lambda x, y, z: test_c(x, y)
+
+        self.train()
+        out_dt, num_t, loss_dt, loss_ct, acc_dt = [], 0, 0., 0., 0.
+        for imgs_d, targets_d in data_d:
+            num_t += len(imgs_d)
+            self.optimizer_d.zero_grad()
+
+            output_d = self.detector(imgs_d)
+            loss_d = self.criterion_d(output_d, targets_d)
+            loss_d.backward()
+            self.optimizer_d.step()
+
+            acc_dt += torch.sum(binary_accuracy(output_d, targets_d, self.detection_threshold)).item()
+            out_dt.append(self.detect_convert(output_d.detach()))
+            loss_dt += loss_d.item()
+        acc_ct = 0.
+        for ep in range(epochs_c):
+            loss_ct, acc = 0., 0.
+            for bn, (_, (test_d, targets_d)) in enumerate(data_c):
+                optimizer_c.zero_grad()
+
+                output_c = self.classifier(out_dt[bn])
+                loss_c = criterion_c(output_c, targets_d, out_dt[bn])
+                loss_c.backward()
+                optimizer_c.step()
+
+                loss_ct += loss_c.item()
+                acc += torch.sum(categorical_accuracy(output_c, targets_d)).item()
+            if ep >= epochs_c - 1:
+                acc_ct = acc
+        self.history['bin_acc'].append(acc_dt / num_t)
+        self.history['cat_acc'].append(acc_ct / num_t)
+        self.history['loss_dt'].append(loss_dt / num_t)
+        self.history['loss_ct'].append(loss_ct / num_t)
+
+        self.eval()
+        num_v, acc_dv, acc_cv, loss_dv, loss_cv = 0, 0., 0., 0., 0.
+        with torch.no_grad():
+            for imgs_v, targets_v in valid_d:  # TODO - properly
+                num_v += len(imgs_v)
+                output_dv = self.detector(imgs_v)
+                loss_dv += self.criterion_d(output_dv, targets_v[0]).item()
+                acc_dv += torch.sum(binary_accuracy(output_dv, targets_v[0], self.detection_threshold)).item()
+            for imgs_v, targets_v in valid_c:  # TODO - properly
+                output_cv = self.classifier(output_dv)
+                loss_cv += criterion_c(output_cv, targets_v[1], output_dv).item()
+                acc_cv += torch.sum(categorical_accuracy(output_cv, targets_v[1])).item()
+            if False:  # self.history['bin_acc_v']:  # TODO - torch.save()
+                if self.history['bin_acc_v'][-1] < acc_dv / num_v:
+                    self.best_d = self.detector.cpu().state_dict()
+                if self.history['cat_acc_v'][-1] < acc_cv / num_v:
+                    self.best_c = self.classifier.cpu().state_dict()
+        self.history['bin_acc_v'].append(acc_dv / num_v)
+        self.history['cat_acc_v'].append(acc_cv / num_v)
+        self.history['loss_dv'].append(loss_dv / num_v)
+        self.history['loss_cv'].append(loss_cv / num_v)
+
 
     def train_model(self, epochs=50, batch_size=8, bboxes=False):  # TODO - bbox version
-        # t_data = DataLoader(self.ds_t, batch_size=batch_size, collate_fn=lambda batch: tuple(zip(*batch)))
-        # v_data = DataLoader(self.ds_v, batch_size=batch_size, collate_fn=lambda batch: tuple(zip(*batch)))
+        # td_data = DataLoader(self.ds_t, batch_size=batch_size, collate_fn=lambda batch: tuple(zip(*batch)))
+        # vd_data = DataLoader(self.ds_v, batch_size=batch_size, collate_fn=lambda batch: tuple(zip(*batch)))
         tc_data = DataLoader(self.ds_t.classify, batch_size=batch_size)
         vc_data = DataLoader(self.ds_v.classify, batch_size=batch_size)
         print(f'\rEpoch {0:03d}/{epochs:03d}', end='')
