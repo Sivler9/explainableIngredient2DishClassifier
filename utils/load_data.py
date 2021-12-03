@@ -46,11 +46,10 @@ def _get_food_data(cmap, root_dir='Data/FFoCat', train=False) -> pd.DataFrame:
     df = df.explode('boxes')
     df['is_part'] = True
     df[['x0', 'y0', 'x1', 'y1', 'part']] = df.boxes.tolist()
-    return df  # .drop('boxes')
+    return df
 
 
-def _get_pascal_data(cmap, root_dir='Data/LTN_ACM_SAC17/pascalpart_dataset/JPEGImages',
-                     train=False) -> pd.DataFrame:
+def _get_pascal_data(cmap, root_dir='Data/LTN_ACM_SAC17/pascalpart_dataset/JPEGImages', train=False) -> pd.DataFrame:
     part_list = set([prt for cls in cmap.values() for prt in cls])
     mode = '_train.txt' if train else '_test.txt'  # TODO - val.csv
     data = {'img': [], 'class': [], 'boxes': []}
@@ -58,7 +57,6 @@ def _get_pascal_data(cmap, root_dir='Data/LTN_ACM_SAC17/pascalpart_dataset/JPEGI
         df_cls = pd.read_csv(os.path.join(root_dir, '..', 'ImageSets', 'Main', cls + mode),
                              header=None, delim_whitespace=True)
         for c in df_cls[df_cls[1] == 1][0]:
-
             img = os.path.join(root_dir, f'{c:06}.jpg')
             if img in data['img']:
                 continue
@@ -78,11 +76,10 @@ def _get_pascal_data(cmap, root_dir='Data/LTN_ACM_SAC17/pascalpart_dataset/JPEGI
     df = pd.DataFrame(data)
     df = df.explode('boxes')
     df[['x0', 'y0', 'x1', 'y1', 'part', 'is_part']] = df.boxes.tolist()
-    return df  # .drop('boxes')
+    return df
 
 
-def _get_monumai_data(cmap, root_dir='Data/OD-MonuMAI/MonuMAI_dataset/',
-                      train=False) -> pd.DataFrame:
+def _get_monumai_data(cmap, root_dir='Data/OD-MonuMAI/MonuMAI_dataset/', train=False) -> pd.DataFrame:
     mode = 'train.csv' if train else 'test.csv'  # TODO - val.csv
     data = {'img': [], 'class': [], 'boxes': []}
     for folder in pd.read_csv(os.path.join(root_dir, mode)).path:
@@ -99,99 +96,76 @@ def _get_monumai_data(cmap, root_dir='Data/OD-MonuMAI/MonuMAI_dataset/',
     df = df.explode('boxes')
     df['is_part'] = True
     df[['x0', 'y0', 'x1', 'y1', 'part']] = df.boxes.tolist()
-    return df  # .drop('boxes')
+    return df
 
 
 class ShapImageDataset(Dataset):
-    class ClassifyView(Dataset):
-        def __init__(self, ds):
-            self.ds, self.class_list, self.part_list = ds, ds.class_list, ds.part_list
-            self.df, self.tf, self.mlb, self.cmap, self.device = ds.df, ds.tf, ds.mlb, ds.cmap, ds.device
-
-        def __len__(self):
-            return self.ds.__len__()
-
-        def __getitem__(self, item):
-            self.ds._classify_mode = True
-            return self.ds[item]
-
-    def __init__(self, dataframe: pd.DataFrame, class_map: dict, transforms: t.Compose = ToTensor(),
+    def __init__(self, dataframe: pd.DataFrame, class_map: dict, transforms: t.Compose = ToTensor(), name='',
                  device=torch.device("cuda:0" if torch.cuda.is_available() else "cpu")):
         self.df, self.tf, self.cmap = dataframe[dataframe.is_part], transforms, class_map
         self.part_list = sorted(set(fea for ele in self.cmap.values() for fea in ele))
-        self.mlb = MultiLabelBinarizer(classes=self.part_list)
         self.class_list = sorted(self.cmap.keys())
-        self._classify_mode = False
-        self.device = device
+        self.device, self.name = device, name
+
+    def part_label_count(self, label_nums):
+        # MultiLabelBinarizer(classes=self.part_list)  # Does not count how many of each part
+        count = [0.]*len(self.part_list)
+        for lbl in label_nums:
+            count[lbl] += 1.
+        return count
 
     def __len__(self):
         return self.df.img.unique().__len__()
-
-    @property
-    def classify(self):
-        return self.ClassifyView(self)
-
-    @property
-    def detect(self):
-        return self
 
     def __getitem__(self, idx):
         if torch.is_tensor(idx):
             idx = idx.tolist()
         elif isinstance(idx, int):
             idx = [idx]
+        elif isinstance(idx, np.int64):
+            idx = [idx.tolist()]
         elif isinstance(idx, slice):
             step = idx.step if idx.step else 1
             start = idx.start if idx.start else 0
             stop = idx.stop if idx.stop else (self.__len__() - 1)
             idx = range(start, stop, step)
 
-        image_f, boxes, parts, clases = [], [], [], []
-        for i in idx:
-            img = self.df.loc[[i], ['img']].values[0, 0]
-            part = self.df.loc[[i], 'part'].values.tolist()
-            clas = self.df.loc[[i], ['class']].values[0, 0]
-            box = self.df.loc[[i], ['x0', 'y0', 'x1', 'y1']].values
-            image_f.append((img, np.array(Image.open(img).convert('RGB'))))
-            clases.append(clas)
-            parts.append(part)
-            boxes.append(box)
-
         tmp = self.tf.processors, self.tf.is_check_args
         if self.df.x0.iloc[0] < 0.:
             self.tf.is_check_args = False
             self.tf.processors = {}
-        if self._classify_mode:
-            augs = [self.tf(image=image_f[i][1], bboxes=boxes[i], parts=parts[i]) for i in range(len(image_f))]
 
-            classes = torch.LongTensor([self.class_list.index(clases[i]) for i in range(len(augs))])
-            parts = torch.LongTensor(self.mlb.fit_transform([[p for p in a['parts']] for a in augs]))  # TODO - count
-            image = torch.stack([a['image'] for a in augs])
+        images, targets, clases, parts = [], [], [], []
+        for i in idx:
+            imgf = self.df.loc[[i], ['img']].values[0, 0]
+            prts = self.df.loc[[i], 'part'].values.tolist()
+            clas = self.df.loc[[i], ['class']].values[0, 0]
+            boxs = self.df.loc[[i], ['x0', 'y0', 'x1', 'y1']].values
 
-            # classes = F.one_hot(classes, num_classes=len(self.classes))
-            target = [torch.squeeze(parts.view(-1, len(self.part_list))).float().to(self.device),
-                      torch.squeeze(classes.view(-1, 1)).long().to(self.device)]
-        elif len(idx) == 1:
-            (image_f, image), boxes, parts, clas = image_f[0], boxes[0], parts[0], clases[0]
+            aug = self.tf(image=np.array(Image.open(imgf).convert('RGB')), bboxes=boxs, parts=prts)
+            img, boxs, prts = aug['image'], aug['bboxes'], aug['parts']
 
-            aug = self.tf(image=image, bboxes=boxes, parts=parts)
-            image, boxes, parts = aug['image'], aug['bboxes'], aug.get('parts', None)
-            boxes = torch.FloatTensor(np.array(boxes)[:, :4].astype(np.float32))
-            area = (boxes[:, 3] - boxes[:, 1]) * (boxes[:, 2] - boxes[:, 0])
-            target = {
-                'labels': torch.LongTensor([self.part_list.index(p) for p in parts], device=self.device),
-                'class': torch.LongTensor([self.class_list.index(clas)], device=self.device),
-                'iscrowd': torch.zeros((len(parts),), dtype=torch.int64, device=self.device),  # 'masks': None,
-                'area': area.to(self.device), 'boxes': boxes.to(self.device),
-                'image_id': torch.LongTensor([idx], device=self.device),
-                'file_name': image_f[:1],
-            }
-        else:
-            raise NotImplementedError('Batch support not implemented for the detection format')
+            boxs = torch.tensor(np.array(boxs)[:, :4], dtype=torch.float, device=self.device)
+            area = (boxs[:, 3] - boxs[:, 1]) * (boxs[:, 2] - boxs[:, 0])
+            prts = [self.part_list.index(p) for p in prts]
+            targets.append({
+                'iscrowd': torch.zeros((len(prts),), dtype=torch.long, device=self.device),
+                'image_id': torch.tensor([i], dtype=torch.long, device=self.device),
+                'labels': torch.tensor(prts, dtype=torch.long, device=self.device),
+                'area': area, 'boxes': boxs,  # 'masks': None,
+                'file_name': [imgf],
+            })
+            clases.append(self.class_list.index(clas))
+            parts.append(self.part_label_count(prts))
+            images.append(img)
+
+        parts = torch.squeeze(torch.tensor(parts, dtype=torch.float).view(-1, len(self.part_list))).to(self.device)
+        clases = torch.squeeze(torch.tensor(clases, dtype=torch.long).view(-1, 1)).to(self.device)
+        # clases = F.one_hot(classes, num_classes=len(self.classes))
+
         if self.df.x0.iloc[0] < 0.:
             self.tf.processors, self.tf.is_check_args = tmp
-        self._classify_mode = False
-        return torch.squeeze(image).to(self.device), target
+        return torch.squeeze(torch.stack(images)).to(self.device), [targets, parts, clases]
 
 
 def get_dataset(name='FFoCat', size=224, device=torch.device('cpu')) -> [ShapImageDataset, ShapImageDataset]:
@@ -244,8 +218,8 @@ def get_dataset(name='FFoCat', size=224, device=torch.device('cpu')) -> [ShapIma
         data_t, data_v = _get_monumai_data(class_map, train=True), _get_monumai_data(class_map, train=False)
     else:
         raise Exception('Dataset not implemented')
-    valid = ShapImageDataset(data_v, class_map, tsfm_valid, device=device)
-    train = ShapImageDataset(data_t, class_map, tsfm_train, device=device)
+    valid = ShapImageDataset(data_v, class_map, tsfm_valid, name=name, device=device)
+    train = ShapImageDataset(data_t, class_map, tsfm_train, name=name, device=device)
     # mean, std = get_mean_std(DataLoader(train, batch_size=100))
     # tsfm_train = T.Compose([T.RandomRotation(30), T.RandomResizedCrop(224), T.RandomHorizontalFlip(), ToTensor()])
     # tsfm_train = t.Compose([t.Resize(256, 256), t.CenterCrop(224, 224), t.Normalize(mean=mean, std=std), ToTensor()],
@@ -259,7 +233,7 @@ def test():
     dev = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
     os.chdir('..')
-    for db in ('PASCAL', 'FFoCat_tiny', 'MonuMAI'):
+    for db in ('FFoCat_tiny', 'PASCAL', 'MonuMAI'):
         data_train, data_tests = get_dataset(db, device=dev)
         a, b = data_train.detect[0], data_tests.classify[2:4]
         for n in (a, b):
