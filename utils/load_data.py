@@ -1,5 +1,5 @@
 """
-TODO - docs
+TODO - docs and type hints
 """
 import os
 
@@ -159,13 +159,14 @@ class ShapImageDataset(Dataset):
             parts.append(self.part_label_count(prts))
             images.append(img)
 
-        parts = torch.squeeze(torch.tensor(parts, dtype=torch.float).view(-1, len(self.part_list))).to(self.device)
-        clases = torch.squeeze(torch.tensor(clases, dtype=torch.long).view(-1, 1)).to(self.device)
+        parts = torch.squeeze(torch.tensor(parts, dtype=torch.float).view(-1, len(self.part_list)))
+        clases = torch.squeeze(torch.tensor(clases, dtype=torch.long).view(-1, 1))
         # clases = F.one_hot(classes, num_classes=len(self.classes))
+        images = torch.squeeze(torch.stack(images))
 
         if self.df.x0.iloc[0] < 0.:
             self.tf.processors, self.tf.is_check_args = tmp
-        return torch.squeeze(torch.stack(images)).to(self.device), [targets, parts, clases]
+        return images.to(self.device), [targets, parts.to(self.device), clases.to(self.device)]
 
 
 def get_dataset(name='FFoCat', size=224, device=torch.device('cpu')) -> [ShapImageDataset, ShapImageDataset]:
@@ -178,8 +179,8 @@ def get_dataset(name='FFoCat', size=224, device=torch.device('cpu')) -> [ShapIma
 
     out_size = (256*size)//224
     print("[INFO] loading label map & dataset ...")
-    mean, std = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]  # COCO 2017
-    bbox = t.BboxParams(format='pascal_voc', min_visibility=0.2, label_fields=['parts'])
+    mean, std = [.485, .456, .406], [.229, .224, .225]  # COCO 2017
+    bbox = t.BboxParams(format='pascal_voc', min_visibility=.2, label_fields=['parts'])
     tsfm_valid = t.Compose([t.Resize(size, size), t.Normalize(mean=mean, std=std), ToTensor()], bbox_params=bbox)
     tsfm_train = t.Compose([t.Resize(out_size, out_size), t.CenterCrop(size, size), t.Normalize(mean=mean, std=std),
                             ToTensor()], bbox_params=bbox)
@@ -221,11 +222,19 @@ def get_dataset(name='FFoCat', size=224, device=torch.device('cpu')) -> [ShapIma
     valid = ShapImageDataset(data_v, class_map, tsfm_valid, name=name, device=device)
     train = ShapImageDataset(data_t, class_map, tsfm_train, name=name, device=device)
     # mean, std = get_mean_std(DataLoader(train, batch_size=100))
-    # tsfm_train = T.Compose([T.RandomRotation(30), T.RandomResizedCrop(224), T.RandomHorizontalFlip(), ToTensor()])
     # tsfm_train = t.Compose([t.Resize(256, 256), t.CenterCrop(224, 224), t.Normalize(mean=mean, std=std), ToTensor()],
     #                        bbox_params=t.BboxParams(format='pascal_voc', label_fields=['parts'], min_visibility=0.2))
     # train.tf = tsfm_train
+    # # tsfm_train = T.Compose([T.RandomRotation(30), T.RandomResizedCrop(224), T.RandomHorizontalFlip(), ToTensor()])
     return train, valid
+
+
+def shap_collate_fn(bat):
+    imgs = torch.squeeze(torch.stack([b[0] for b in bat]))
+    tars = [b[1][0] for b in bat]
+    lbls = torch.squeeze(torch.stack([b[1][1] for b in bat]))
+    clss = torch.squeeze(torch.stack([b[1][2] for b in bat]))
+    return imgs, (tars, lbls, clss)
 
 
 def test():
@@ -235,14 +244,13 @@ def test():
     os.chdir('..')
     for db in ('FFoCat_tiny', 'PASCAL', 'MonuMAI'):
         data_train, data_tests = get_dataset(db, device=dev)
-        a, b = data_train.detect[0], data_tests.classify[2:4]
-        for n in (a, b):
-            print(n[0][0].shape, type(n[0][-1]))
-        for n in DataLoader(data_tests.classify, batch_size=2):
-            print(n)
-            break
-        for n in DataLoader(data_train, batch_size=2, collate_fn=lambda batch: tuple(zip(*batch))):
-            print(n)
+        i, (t, l, c) = data_train[:2]
+        print(i.shape, l, c)
+        for tt in t:
+            print(tt)
+        for n in DataLoader(data_tests, batch_size=2, collate_fn=shap_collate_fn):
+            for nn in n:
+                print(nn)
             break
     exit(0)
 

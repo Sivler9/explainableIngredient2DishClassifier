@@ -1,5 +1,5 @@
 """
-TODO - docs
+TODO - docs and type hints
 """
 import numpy as np
 
@@ -13,21 +13,34 @@ from torch.utils.data import DataLoader
 from utils.load_data import ShapImageDataset
 
 
-def reduce_shap(contrib, h=1, device=torch.device('cpu')):
-    """TODO - docs
-    Here apply the max function (Lineal instance)
+def reduce_shap(contrib, h=1, exp=False, device=torch.device('cpu')):
+    """Apply the max function
+    TODO - docs
+    :param contrib:
+    :param h:
+    :param exp:
+    :param device:
+    :return:
     """
-    if True:  # lineal instance
-        shap_coeff_s = torch.tensor(1 - h * np.min(contrib, axis=1), requires_grad=True,
-                                    dtype=torch.float, device=device)
-    return shap_coeff_s
+    shap_coeff_s = -h*np.min(contrib, axis=1)
+    if exp:  # exponential
+        shap_coeff_s = np.exp(shap_coeff_s)
+    else:  # lineal instance
+        shap_coeff_s = 1 + shap_coeff_s
+    return torch.tensor(shap_coeff_s, requires_grad=False, dtype=torch.float, device=device)
 
 
 def kg_from_dict(dic_s, feat=None):
-    """TODO - docs"""
+    """
+    Create knowledge graph from class map
+
+    :param dict dic_s: Class tp feature map
+    :param list feat: Pre-computed features list
+    :returns np.ndarray: Knowledge Graph
+    """
     if feat is None:
         feat = sorted(set([el for sty in dic_s.values() for el in sty]))
-    knowledge_graph = -np.ones((len(feat), len(dic_s)))
+    knowledge_graph = -np.ones((len(feat), len(dic_s)), dtype=np.uint8)
     for i, local_el in enumerate(feat):
         for k, sty in enumerate(sorted(dic_s.keys())):
             if local_el in dic_s[sty]:
@@ -35,9 +48,15 @@ def kg_from_dict(dic_s, feat=None):
     return knowledge_graph
 
 
-def graph_edit_distance(features, shap_values, dataset: ShapImageDataset, threshold=0.001):
-    """TODO - docs
-    Fully compute the GED, given feature vectors and shap values. Build KG, build SAG and compute GED"""
+def shap_graph_edit_distances(features, shap_values, dataset: ShapImageDataset, threshold=0.001):
+    """Fully compute the GED, given feature vectors and shap values. Build KG, build SAG and compute GED
+    TODO - docs
+    :param features:
+    :param shap_values:
+    :param dataset:
+    :param threshold:
+    :return:
+    """
     def build_kg(dictionary):
         graph = {}
         for k, v in dictionary.items():
@@ -50,22 +69,26 @@ def graph_edit_distance(features, shap_values, dataset: ShapImageDataset, thresh
                     graph[n].add(k)
         return graph
 
-    def graph_distance(expert, sag):  # div 2 - because graph is not directed
+    def edit_distance(expert, sag):  # div 2 - because graph is not directed
         return sum([len(expert[n] ^ sag[n]) for n in expert.keys() & sag.keys()])/2.
 
     KG, parts, clases = dataset.cmap, dataset.part_list, dataset.class_list
     features = features.detach().cpu().numpy()
     shap_array = np.dstack(shap_values)
-    features[features < .1] = 0
+    features[features < .5] = 0.
     expert_graph = build_kg(KG)
 
-    d_tot = 0
+    d_tot = []
     for i in range(len(shap_array)):
         shap_graph = {}
+        feats = features[i]
+        feats2 = feats + (feats == 0.)
         for k in range(shap_array.shape[-1]):
-            facade = np.copy(shap_array[i, :, k])
-            for j, f in enumerate(features[k] > 0.):
+            facade = shap_array[i, :, k]*feats2
+            for j, f in enumerate(feats > 0.):  # Always all positive or 0
                 clas, part = f'c{k}', f'p{j}'
+                # XOR - /either/ feat*shap  > threshold   when   feats is /not/  > 0
+                #          /xor/ feat*shap <= threshold   when   feats is /not/ <= 0
                 if not f ^ (facade[j] > threshold):
                     if clas not in shap_graph:
                         shap_graph[clas] = {part}
@@ -75,43 +98,48 @@ def graph_edit_distance(features, shap_values, dataset: ShapImageDataset, thresh
                         shap_graph[part] = {clas}
                     else:
                         shap_graph[part].add(clas)
-            # TODO - Report bug to original repo
-        d_tot += graph_distance(expert_graph, shap_graph)
-    return float(d_tot) / len(shap_array)
+        d_tot.append(edit_distance(expert_graph, shap_graph))
+    return d_tot  # float(d_tot) / shap_array.shape[0]
 
 
 class ShapBackLoss(nn.CrossEntropyLoss):
     """TODO - docs"""
 
     def __init__(self, dataset: ShapImageDataset, data_train, classificator, device=torch.device('cpu')):
-        super(ShapBackLoss, self).__init__(reduction='none')  # self.reduction =
+        super(ShapBackLoss, self).__init__()  # (reduction='none')  # self.reduction =
         self.dataset, self.device = dataset, device
         self.explainer = shap.DeepExplainer(classificator, data_train)
         # TODO - Solve errors with shap.KernelExplainer (May be TF2 exclusive)
         self.knowledge = kg_from_dict(dataset.cmap, dataset.part_list)
 
-    def compare_shap_and_kg(self, shap_values, true_labels, features, threshold=0):
-        """TODO - docs
-        Functions to compute instance level weights. Here compute misattribution.
+    def compare_shap_and_kg(self, shap_values, true_labels, threshold=0.):
+        """Computes misattribution.
+        TODO - docs
+        :param shap_values:
+        :param true_labels:
+        :param features:
+        :param threshold:
+        :return:
         """
-        contrib = np.zeros((len(true_labels), len(features)))
+        contrib = np.zeros(shap_values[0].shape)  # (len(true_labels), len(features))
         for k, tl in enumerate(true_labels):
             local_kg = self.knowledge[:, tl]
             contrib[k] = shap_values[tl][k] * local_kg
-        contrib[contrib > -threshold] = 0
+        contrib[contrib > -threshold] = 0.
         return contrib
 
     def shap_coefficient(self, y_pred: Tensor, target: Tensor, elems: Tensor = None):
         target, elems = target.long(), elems.float()
         # SHAP
         if elems is not None and torch.is_grad_enabled():
-            shap_values = self.explainer.shap_values(elems)
-            shap_contrib = self.compare_shap_and_kg(shap_values, target, self.dataset.part_list)
+            shap_values = self.explainer.shap_values(elems)  # needs grad_enabled, it seems
+            shap_contrib = self.compare_shap_and_kg(shap_values, target, threshold=.0)
             shap_coeff = reduce_shap(shap_contrib, device=self.device)
-            ged = graph_edit_distance(elems, shap_values, self.dataset, threshold=.001)
+            ged = shap_graph_edit_distances(elems, shap_values, self.dataset, threshold=.001)
         else:
             shap_coeff = torch.ones((len(y_pred),), device=self.device)
-            ged = np.nan
+            ged = np.empty((len(y_pred),))
+            ged[:] = np.nan
 
         # if self.reduction == 'none': ...
         # torch.dot(loss, shap_coeff) / len(y_pred), ged
@@ -132,12 +160,12 @@ def test():
         nn.Linear(in_features=len(data_train.part_list), out_features=11), nn.ReLU(),
         nn.Linear(in_features=11, out_features=len(data_train.class_list)),  # nn.Softmax(dim=-1),
     );  model.to(dev)
-    loss = ShapBackLoss(dataset=data_train.classify, data_train=data_train.classify[:][1][0],
+    loss = ShapBackLoss(dataset=data_train, data_train=data_train[:16][1][0],
                         classificator=model, device=dev)
     opt = torch.optim.Adam(model.parameters())
 
     train_data = DataLoader(data_train.classify, batch_size=8, shuffle=True)
-    _, (X_batch, Y_batch) = next(iter(train_data))
+    _, (_, X_batch, Y_batch) = next(iter(train_data))
 
     model.train()
     print(next(iter(model.parameters())).data[0])

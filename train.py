@@ -3,6 +3,7 @@ import copy
 import math
 import random
 import os.path
+import pickle
 
 import numpy as np
 import torch.optim
@@ -24,9 +25,8 @@ def categorical_accuracy(y_pred: torch.Tensor, y_true: torch.Tensor):
     return torch.eq(y_true, torch.argmax(y_pred.detach(), dim=-1)).float()
 
 
-def binary_accuracy(y_pred: torch.Tensor, y_true: torch.Tensor,
-                    threshold=torch.FloatTensor([.5]), device=DEFAULT_DEVICE):
-    return torch.mean(torch.eq(y_true, torch.gt(y_pred.detach(), threshold.to(device))).float(), dim=-1)
+def binary_accuracy(y_pred: torch.Tensor, y_true: torch.Tensor, threshold=torch.FloatTensor([.5]), device=DEFAULT_DEVICE):
+    return torch.mean(torch.eq(torch.gt(y_true, 0.), torch.gt(y_pred.detach(), threshold.to(device))).float(), dim=-1)
 
 
 class ExplanetModel(nn.Module):
@@ -36,9 +36,9 @@ class ExplanetModel(nn.Module):
         self.device = device
         self.best_d, self.best_c = None, None
         self.ds_t, self.ds_v = train_data, valid_data
-        # base_prob = 1./len(train_data.class_list)  # .5 np.nan .5 np.nan base_prob np.nan base_prob np.nan
-        self.history = {'bin_acc': [], 'loss_dt': [], 'bin_acc_v': [], 'loss_dv': [],  # TODO - explicability, bbox
-                        'cat_acc': [], 'loss_ct': [], 'cat_acc_v': [], 'loss_cv': [], 'shap_ged': []}
+        # base_prob = 1./len(train_data.class_list)  # .5 np.nan .5 np.nan ... base_prob np.nan base_prob np.nan
+        self.history = {'bin_acc': [], 'loss_dt': [], 'bin_acc_v': [], 'loss_dv': [], 'shap_ged': [],  # TODO - bbox
+                        'cat_acc': [], 'loss_ct': [], 'cat_acc_v': [], 'loss_cv': []}  # , 'shap_ged_v': []
         if isinstance(backbone, models.Inception3):
             # Based on: https://github.com/ivanDonadello/Food-Categories-Classification
             self.detector = backbone  # if backbone else resnet50(pretrained=True)
@@ -64,15 +64,19 @@ class ExplanetModel(nn.Module):
             self.optimizer_d = torch.optim.SGD(self.detector.parameters(), lr=.0003, momentum=.9)
             self.scheduler_d = torch.optim.lr_scheduler.StepLR(self.optimizer_d, 9, gamma=.1, last_epoch=-1)
         if not isinstance(self.detector.fc[-1], nn.Sigmoid):
-            self.criterion_d = nn.BCEWithLogitsLoss()
+            self.criterion_d = nn.BCEWithLogitsLoss(reduction='none')
         else:
-            self.criterion_d = nn.BCELoss()
+            self.criterion_d = nn.BCELoss(reduction='none')
 
         self.detection_threshold = torch.tensor([.5]).to(self.device)
         if box_convert == 'box':
             def box_scores_to_array(x: dict, dataset=train_data):
-                """TODO - docs
-                Add scores per object part"""
+                """Aggregate scores per object part
+                TODO - docs
+                :param x:
+                :param dataset:
+                :return:
+                """
                 agg = [0.]*len(dataset.part_list)
                 for i, l in enumerate(x['labels'].detach().cpu().numpy()):
                     agg[l] += x['scores'][i].item()
@@ -105,7 +109,7 @@ class ExplanetModel(nn.Module):
         self.classifier = nn.Sequential(
             nn.Linear(len(data.dataset.part_list), classifier_neurons), nn.ReLU(),
             nn.Linear(classifier_neurons, len(data.dataset.class_list)), nn.Softmax(dim=-1)
-        );  self.classifier.to(self.device)  #
+        );  self.classifier.to(self.device)
         optimizer_c = torch.optim.Adam(self.classifier.parameters())
         samples = data.dataset[np.random.choice(int(len(data.dataset)), int(.1*len(data.dataset)), False)][1][1]
         criterion_c = ShapBackLoss(data.dataset, samples, self.classifier, self.device)
@@ -113,80 +117,87 @@ class ExplanetModel(nn.Module):
         self.detector.eval()
         self.classifier.train()
         shap_ged, loss_ct, acc_ct = 0., 0., 0.
-        shap_loss = []
+        shap_coeffs = []
         for ep in range(epochs_c):
             loss_ct = 0.
-            for imgs_d, (targets_d, parts_d, clases_d) in data:
+            for imgs_t, (targets_t, parts_t, clases_t) in data:
                 optimizer_c.zero_grad()
 
-                input_c = self.detect_convert(self.detector(imgs_d)).detach()
-                output_c = self.classifier(input_c)
+                input_ct = self.detect_convert(self.detector(imgs_t).detach())
+                output_ct = self.classifier(input_ct)
 
-                loss_c = criterion_c(output_c, targets_d)
+                loss_c = criterion_c(output_ct, clases_t)
                 loss_c.backward()
                 optimizer_c.step()
 
                 if ep >= epochs_c - 1:
-                    loss_ct += loss_c.item()
-                    acc_ct += torch.sum(categorical_accuracy(output_c, targets_d)).item()
-                    sc, ged = criterion_c.shap_coefficient(output_c, clases_d, input_c)
-                    shap_loss.append(sc)
-                    shap_ged += ged
+                    loss_ct += loss_c.item()*len(targets_t)
+                    acc_ct += torch.sum(categorical_accuracy(output_ct, clases_t)).item()
+                    sc, ged = criterion_c.shap_coefficient(output_ct, clases_t, input_ct)
+                    shap_coeffs.append(sc)
+                    shap_ged += sum(ged)
 
         self.detector.train()
         num_t, loss_dt, acc_dt = 0, 0., 0.
-        for bn, (imgs_d, (targets_d, parts_d, clases_d)) in enumerate(data):
-            num_t += len(imgs_d)
+        for bn, (imgs_t, (targets_t, parts_t, clases_t)) in enumerate(data):
+            num_t += len(targets_t)
             self.optimizer_d.zero_grad()
 
-            output_d = self.detector(imgs_d)
-            if isinstance(output_d, models.InceptionOutputs):  # more exceptions
-                output_d = output_d.logits
+            output_d = self.detector(imgs_t)
+            if isinstance(output_d, models.InceptionOutputs):  # TODO - more exceptions
+                output_d = output_d.logits  # Ignore aux_logits
 
-            loss_d = torch.dot(self.criterion_d(output_d, parts_d), shap_loss[bn])  # [0]
+            crit_d = torch.mean(self.criterion_d(output_d, parts_t), dim=-1)
+            loss_d = torch.dot(crit_d, shap_coeffs[bn])/len(crit_d)
             loss_d.backward()
             self.optimizer_d.step()
 
-            acc_dt += torch.sum(binary_accuracy(output_d, parts_d, self.detection_threshold)).item()
-            loss_dt += loss_d.item()
-        self.history['bin_acc'].append(acc_dt / num_t)
-        self.history['cat_acc'].append(acc_ct / num_t)
-        self.history['loss_dt'].append(loss_dt / num_t)
-        self.history['loss_ct'].append(loss_ct / num_t)
-        self.history['shap_ged'].append(shap_ged / num_t)
+            acc_dt += torch.sum(binary_accuracy(output_d, parts_t, self.detection_threshold)).item()
+            loss_dt += loss_d.item()*len(targets_t)
+        self.history['bin_acc'].append(acc_dt/num_t)
+        self.history['cat_acc'].append(acc_ct/num_t)
+        self.history['loss_dt'].append(loss_dt/num_t)
+        self.history['loss_ct'].append(loss_ct/num_t)
+        self.history['shap_ged'].append(shap_ged/num_t)
 
         self.eval()
-        num_v, acc_dv, acc_cv, loss_dv, loss_cv = 0, 0., 0., 0., 0.
+        num_v, ged_v, acc_dv, acc_cv, loss_dv, loss_cv = 0, 0., 0., 0., 0., 0.
         with torch.no_grad():
             for imgs_v, (targets_v, parts_v, clases_v) in valid:
-                num_v += len(imgs_v)
+                num_v += len(targets_v)
                 output_dv = self.detector(imgs_v)
-                output_cv = self.classifier(self.detect_convert(output_dv))
-                loss_dv += self.criterion_d(output_dv, parts_v).item()
-                loss_cv += criterion_c(output_cv, clases_v).item()
+                input_cv = self.detect_convert(output_dv)
+                output_cv = self.classifier(input_cv)
+                crit_dv = torch.mean(self.criterion_d(output_dv, parts_v))  # , dim=-1)
+                # sc, ged = criterion_c.shap_coefficient(output_cv, clases_v, input_cv)
+                loss_dv += len(targets_v)*crit_dv.item()  # (torch.dot(crit_dv, sc)/len(crit_dv)).item()
                 acc_dv += torch.sum(binary_accuracy(output_dv, parts_v, self.detection_threshold)).item()
+                # ged_v += sum(ged)
+                loss_cv += criterion_c(output_cv, clases_v).item()*len(targets_v)
                 acc_cv += torch.sum(categorical_accuracy(output_cv, clases_v)).item()
-            if self.history['bin_acc_v']:  # TODO - torch.save()
+            if False and self.history['bin_acc_v']:  # TODO - torch.save()
                 if self.history['bin_acc_v'][-1] < acc_dv / num_v:
                     self.best_d = self.detector.cpu().state_dict()
                 if self.history['cat_acc_v'][-1] < acc_cv / num_v:
                     self.best_c = self.classifier.cpu().state_dict()
-        self.history['bin_acc_v'].append(acc_dv / num_v)
-        self.history['cat_acc_v'].append(acc_cv / num_v)
-        self.history['loss_dv'].append(loss_dv / num_v)
-        self.history['loss_cv'].append(loss_cv / num_v)
+        # self.history['shap_ged_v'].append(ged_v/num_v)
+        self.history['bin_acc_v'].append(acc_dv/num_v)
+        self.history['cat_acc_v'].append(acc_cv/num_v)
+        self.history['loss_dv'].append(loss_dv/num_v)
+        self.history['loss_cv'].append(loss_cv/num_v)
 
-    def train_model(self, epochs=50, batch_size=64, bboxes=False):  # TODO - bbox version
-        t_data = DataLoader(self.ds_t, batch_size=batch_size, collate_fn=lambda batch: tuple(zip(*batch)))
-        v_data = DataLoader(self.ds_v, batch_size=batch_size, collate_fn=lambda batch: tuple(zip(*batch)))
-        print(f'\rEpoch {0:03d}/{epochs:03d}', end='')
+    def train_model(self, epochs=50, batch_size=16, bboxes=False):  # TODO - bbox version
+        t_data = DataLoader(self.ds_t, batch_size=batch_size, collate_fn=shap_collate_fn)
+        v_data = DataLoader(self.ds_v, batch_size=batch_size, collate_fn=shap_collate_fn)
+        print(f'[INFO] training EXPLANet ...\nEpoch {0:03d}/{epochs:03d}', end='')
         for ep in range(epochs):
             self.train_one_epoch(t_data, v_data)
             if self.scheduler_d:
                 self.scheduler_d.step()
             print(f'\nEpoch {ep + 1:03d}/{epochs:03d}'
-                  f' (bin_acc = {self.history["bin_acc"][-1]}'
-                  f', cat_acc = {self.history["cat_acc"][-1]})', end='')  # TODO - shap_ged
+                  f' (bin_acc = {self.history["bin_acc"][-1]:.5f}|{self.history["bin_acc_v"][-1]:.5f}'
+                  f', cat_acc = {self.history["cat_acc"][-1]:.5f}|{self.history["cat_acc_v"][-1]:.5f}'
+                  f', shap_ged = {self.history["shap_ged"][-1]:.5f})', end='')
         print('\nFinished')
         return self.history
 
@@ -290,16 +301,42 @@ def main():
 
     model = ExplanetModel(data_train, data_valid, backbone=backbone, box_convert=box_convert)
     hist = model.train_model(epochs=50)
-    print(pd.DataFrame(hist).T)
+
+    # TODO - resume
+    save_dir = f'./results/{fecha}/'
+    torch.save(model.classifier.state_dict(), f'{save_dir}/classify_{backbone.__class__.__name__}.pth')
+    torch.save(model.detector.state_dict(), f'{save_dir}/detect_{backbone.__class__.__name__}.pth')
+    # torch.save(model, f'./results/{fecha}/{backbone.__class__.__name__}.pth')  # TODO - .state_dict()
+
+    with open(f'{save_dir}/hist_{backbone.__class__.__name__}.pkl', 'wb') as pickle_file:
+        pickle.dump(hist, pickle_file)
+    # df_hist = pd.DataFrame(hist)
+    # print(df_hist.T)
+
+    plt.figure()
     for k, v in hist.items():
-        plt.plot(v, label=k)
-        # print(k, '\n', v)
+        if 'loss' in k:
+            plt.plot(v, label=k)  # print(k, '\n', v)
     plt.legend()
     plt.show()
+    plt.savefig(f'{save_dir}/0.pdf')
 
-    torch.save(model.classifier, f'./results/{fecha}/{backbone.__name__}_classify.pth')
-    torch.save(model.detector, f'./results/{fecha}/{backbone.__name__}_detect.pth')
-    torch.save(model, f'./results/{fecha}/{backbone.__name__}.pth')  # TODO - .state_dict()
+    plt.figure()
+    for k, v in hist.items():
+        if 'acc' in k:
+            plt.plot(v, label=k)
+    plt.legend()
+    plt.show()
+    plt.savefig(f'{save_dir}/1.pdf')
+
+    plt.figure()
+    for k, v in hist.items():
+        if 'ged' in k:
+            plt.plot(v, label=k)
+    plt.legend()
+    plt.show()
+    plt.savefig(f'{save_dir}/2.pdf')
+
     # exit(0)
 
 
