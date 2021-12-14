@@ -69,8 +69,9 @@ def shap_graph_edit_distances(features, shap_values, dataset: ShapImageDataset, 
                     graph[n].add(k)
         return graph
 
-    def edit_distance(expert, sag):  # div 2 - because graph is not directed
-        return sum([len(expert[n] ^ sag[n]) for n in expert.keys() & sag.keys()])/2.
+    def filtered_edit_distance(expert, sag):  # div 2 - because graph is not directed
+        sag_k = expert.keys() & sag.keys()  # == sag.keys() (ideally, anyways)
+        return sum([len((expert[n] ^ sag[n]) & sag_k) for n in sag_k])/2.
 
     KG, parts, clases = dataset.cmap, dataset.part_list, dataset.class_list
     features = features.detach().cpu().numpy()
@@ -82,10 +83,12 @@ def shap_graph_edit_distances(features, shap_values, dataset: ShapImageDataset, 
     for i in range(len(shap_array)):
         shap_graph = {}
         feats = features[i]
-        feats2 = feats + (feats == 0.)
+        feats2 = feats + (feats == 0.)  # bug in original code - was always False
         for k in range(shap_array.shape[-1]):
             facade = shap_array[i, :, k]*feats2
             for j, f in enumerate(feats > 0.):  # Always all positive or 0
+                # if not f:  # bug in original code - was always False
+                #     continue
                 clas, part = f'c{k}', f'p{j}'
                 # XOR - /either/ feat*shap  > threshold   when   feats is /not/  > 0
                 #          /xor/ feat*shap <= threshold   when   feats is /not/ <= 0
@@ -98,7 +101,7 @@ def shap_graph_edit_distances(features, shap_values, dataset: ShapImageDataset, 
                         shap_graph[part] = {clas}
                     else:
                         shap_graph[part].add(clas)
-        d_tot.append(edit_distance(expert_graph, shap_graph))
+        d_tot.append(filtered_edit_distance(expert_graph, shap_graph))
     return d_tot  # float(d_tot) / shap_array.shape[0]
 
 
@@ -122,7 +125,7 @@ class ShapBackLoss(nn.CrossEntropyLoss):
         :return:
         """
         contrib = np.zeros(shap_values[0].shape)  # (len(true_labels), len(features))
-        for k, tl in enumerate(true_labels):
+        for k, tl in enumerate(true_labels.view(-1, 1)):
             local_kg = self.knowledge[:, tl]
             contrib[k] = shap_values[tl][k] * local_kg
         contrib[contrib > -threshold] = 0.

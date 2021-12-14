@@ -111,7 +111,7 @@ class ShapImageDataset(Dataset):
         # MultiLabelBinarizer(classes=self.part_list)  # Does not count how many of each part
         count = [0.]*len(self.part_list)
         for lbl in label_nums:
-            count[lbl] += 1.
+            count[lbl] = 1.  # TODO - Use count
         return count
 
     def __len__(self):
@@ -231,7 +231,7 @@ def get_dataset(name='FFoCat', size=224, device=torch.device('cpu')) -> [ShapIma
 
 def shap_collate_fn(bat):
     imgs = torch.squeeze(torch.stack([b[0] for b in bat]))
-    tars = [b[1][0] for b in bat]
+    tars = [b[1][0][0] for b in bat]
     lbls = torch.squeeze(torch.stack([b[1][1] for b in bat]))
     clss = torch.squeeze(torch.stack([b[1][2] for b in bat]))
     return imgs, (tars, lbls, clss)
