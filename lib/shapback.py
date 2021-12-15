@@ -87,8 +87,8 @@ def shap_graph_edit_distances(features, shap_values, dataset: ShapImageDataset, 
         for k in range(shap_array.shape[-1]):
             facade = shap_array[i, :, k]*feats2
             for j, f in enumerate(feats > 0.):  # Always all positive or 0
-                # if not f:  # bug in original code - was always False
-                #     continue
+                if not f:  # bug in original code - was always False
+                    continue
                 clas, part = f'c{k}', f'p{j}'
                 # XOR - /either/ feat*shap  > threshold   when   feats is /not/  > 0
                 #          /xor/ feat*shap <= threshold   when   feats is /not/ <= 0

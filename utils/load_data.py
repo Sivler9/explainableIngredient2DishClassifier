@@ -145,8 +145,13 @@ class ShapImageDataset(Dataset):
             aug = self.tf(image=np.array(Image.open(imgf).convert('RGB')), bboxes=boxs, parts=prts)
             img, boxs, prts = aug['image'], aug['bboxes'], aug['parts']
 
-            boxs = torch.tensor(np.array(boxs)[:, :4], dtype=torch.float, device=self.device)
-            area = (boxs[:, 3] - boxs[:, 1]) * (boxs[:, 2] - boxs[:, 0])
+            if boxs:
+                boxs = torch.tensor(np.array(boxs)[:, :4], dtype=torch.float, device=self.device)
+                area = (boxs[:, 3] - boxs[:, 1]) * (boxs[:, 2] - boxs[:, 0])
+            else:  # breakpoint()
+                boxs = torch.empty(0, 4)
+                area = torch.empty(0, 1)
+
             prts = [self.part_list.index(p) for p in prts]
             targets.append({
                 'iscrowd': torch.zeros((len(prts),), dtype=torch.long, device=self.device),
