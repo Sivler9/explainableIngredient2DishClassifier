@@ -106,16 +106,22 @@ class ShapImageDataset(Dataset):
         self.part_list = sorted(set(fea for ele in self.cmap.values() for fea in ele))
         self.class_list = sorted(self.cmap.keys())
         self.device, self.name = device, name
+        self.count = False  # TODO - Use count
+        # MultiLabelBinarizer(classes=self.part_list)  # Does not count how many of each part
 
     def part_label_count(self, label_nums):
-        # MultiLabelBinarizer(classes=self.part_list)  # Does not count how many of each part
         count = [0.]*len(self.part_list)
-        for lbl in label_nums:
-            count[lbl] = 1.  # TODO - Use count
+        if self.count:
+            for lbl in label_nums:
+                count[lbl] += 1.
+        else:
+            for lbl in label_nums:
+                count[lbl] = 1.
         return count
 
     def __len__(self):
-        return self.df.img.unique().__len__()
+        # self.df.index[-1] + 1
+        return self.df.index.unique().__len__()
 
     def __getitem__(self, idx):
         if torch.is_tensor(idx):
@@ -135,22 +141,26 @@ class ShapImageDataset(Dataset):
             self.tf.is_check_args = False
             self.tf.processors = {}
 
+        indices = self.df.index.unique()
         images, targets, clases, parts = [], [], [], []
         for i in idx:
-            imgf = self.df.loc[[i], ['img']].values[0, 0]
-            prts = self.df.loc[[i], 'part'].values.tolist()
-            clas = self.df.loc[[i], ['class']].values[0, 0]
-            boxs = self.df.loc[[i], ['x0', 'y0', 'x1', 'y1']].values
+            df_local = self.df.loc[[indices[i]]]
+            imgf = df_local.loc[:, ['img']].values[0, 0]
+            prts = df_local.loc[:, 'part'].values.tolist()
+            clas = df_local.loc[:, ['class']].values[0, 0]
+            boxs = df_local.loc[:, ['x0', 'y0', 'x1', 'y1']].values
 
             aug = self.tf(image=np.array(Image.open(imgf).convert('RGB')), bboxes=boxs, parts=prts)
             img, boxs, prts = aug['image'], aug['bboxes'], aug['parts']
 
-            if boxs:
+            if boxs and self.df.x0.iloc[0] >= 0.:
                 boxs = torch.tensor(np.array(boxs)[:, :4], dtype=torch.float, device=self.device)
-                area = (boxs[:, 3] - boxs[:, 1]) * (boxs[:, 2] - boxs[:, 0])
-            else:  # breakpoint()
-                boxs = torch.empty(0, 4)
-                area = torch.empty(0, 1)
+                area = (boxs[:, 3] - boxs[:, 1]) * (boxs[:, 2] - boxs[:, 0])  # (y1 - y0) * (x1 - x0)
+                if any(torch.le(area, 0.)):
+                    breakpoint()
+            else:
+                boxs = torch.zeros((0, 4), dtype=torch.float32)
+                area = torch.zeros(0, dtype=torch.float32)
 
             prts = [self.part_list.index(p) for p in prts]
             targets.append({
@@ -190,10 +200,11 @@ def get_dataset(name='FFoCat', size=224, device=torch.device('cpu')) -> [ShapIma
     tsfm_train = t.Compose([t.Resize(out_size, out_size), t.CenterCrop(size, size), t.Normalize(mean=mean, std=std),
                             ToTensor()], bbox_params=bbox)
     if 'FFoCat' in name:
-        root_dir = f'Data/{name}'
+        nam = name[:-5] if name[-5:] == '_test' else name
+        root_dir = f'Data/{nam}'
         class_map = _build_food_labels_dict(root_dir)
-        data_t, data_v = _get_food_data(class_map, root_dir, train=True), _get_food_data(class_map, root_dir, train=0)
-    elif name == 'PASCAL':
+        data_t, data_v = _get_food_data(class_map, root_dir, train=True), _get_food_data(class_map, root_dir, train=False)
+    elif 'PASCAL' in name:
         class_map = {
             'Bottle': ['Cap', 'Body'], 'Pottedplant': ['Pot', 'Plant'], 'Tvmonitor': ['Screen', 'Tvmonitor'],
             'Boat': ['Boat'], 'Chair': ['Chair'], 'Diningtable': ['Diningtable'], 'Sofa': ['Sofa'],
@@ -213,7 +224,7 @@ def get_dataset(name='FFoCat', size=224, device=torch.device('cpu')) -> [ShapIma
             'Train': ['Locomotive', 'Coach', 'Headlight'],
         }
         data_t, data_v = _get_pascal_data(class_map, train=True), _get_pascal_data(class_map, train=False)
-    elif name == 'MonuMAI':
+    elif 'MonuMAI' in name:
         class_map = {
             'Renaissance': ['fronton', 'fronton-curvo', 'serliana',
                             'arco-medio-punto', 'vano-adintelado', 'ojo-de-buey'],
@@ -224,6 +235,9 @@ def get_dataset(name='FFoCat', size=224, device=torch.device('cpu')) -> [ShapIma
         data_t, data_v = _get_monumai_data(class_map, train=True), _get_monumai_data(class_map, train=False)
     else:
         raise Exception('Dataset not implemented')
+    if name[-5:] == '_test':
+        data_t = data_t.loc[np.random.choice(data_t.index[-1] + 1, 32, False)]
+        data_v = data_v.loc[np.random.choice(data_v.index[-1] + 1,  8, False)]
     valid = ShapImageDataset(data_v, class_map, tsfm_valid, name=name, device=device)
     train = ShapImageDataset(data_t, class_map, tsfm_train, name=name, device=device)
     # mean, std = get_mean_std(DataLoader(train, batch_size=100))
@@ -235,10 +249,11 @@ def get_dataset(name='FFoCat', size=224, device=torch.device('cpu')) -> [ShapIma
 
 
 def shap_collate_fn(bat):
-    imgs = torch.squeeze(torch.stack([b[0] for b in bat]))
+    imgs = torch.stack([b[0] for b in bat])
     tars = [b[1][0][0] for b in bat]
-    lbls = torch.squeeze(torch.stack([b[1][1] for b in bat]))
-    clss = torch.squeeze(torch.stack([b[1][2] for b in bat]))
+    lbls = torch.stack([b[1][1] for b in bat])
+    clss = torch.stack([b[1][2] for b in bat])
+    # print(imgs.shape, lbls.shape, clss.shape)
     return imgs, (tars, lbls, clss)
 
 

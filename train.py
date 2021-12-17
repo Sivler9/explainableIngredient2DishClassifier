@@ -40,35 +40,62 @@ class ExplanetModel(nn.Module):
         # base_prob = 1./len(train_data.class_list)  # .5 np.nan .5 np.nan ... base_prob np.nan base_prob np.nan
         self.history = {'bin_acc': [], 'loss_dt': [], 'bin_acc_v': [], 'loss_dv': [], 'shap_ged': [],  # TODO - bbox
                         'cat_acc': [], 'loss_ct': [], 'cat_acc_v': [], 'loss_cv': []}  # , 'shap_ged_v': []
+
+        def replace_last_layer(model, out_feat):  # TODO - Detect if the same model is passes twice+
+            if isinstance(model, models.detection.FasterRCNN):
+                model.fc = nn.Sequential(
+                    nn.Linear(2048, out_feat),
+                    nn.Sigmoid(),  # Included in nn.BCEWithLogitsLoss()
+                )
+                model = model.fc
+            else:
+                last_candidates = model._modules
+                if len(last_candidates):
+                    layer = replace_last_layer(next(reversed(last_candidates.values())), out_feat)
+                    if not len(layer._modules.keys()):
+                        replacement = nn.Sequential(
+                            nn.Linear(layer.in_features, out_feat),
+                            nn.Sigmoid(),  # Included in nn.BCEWithLogitsLoss()
+                        )
+                        if isinstance(model, nn.Sequential):
+                            model[-1] = replacement
+                        else:
+                            name = next(reversed(last_candidates.keys()))
+                            setattr(model, name, replacement)
+                        model = replacement
+                    else:
+                        model = layer
+            return model
+
+        last_layer = None
         if isinstance(backbone, models.Inception3):
             # Based on: https://github.com/ivanDonadello/Food-Categories-Classification
-            self.detector = backbone  # if backbone else resnet50(pretrained=True)
-            self.detector.dropout = nn.Identity()           # Moved
+            self.detector = backbone
+            self.detector.dropout = nn.Identity()           # Moved - to match tf2/keras
             self.detector.fc = nn.Sequential(
                 # nn.AdaptiveAvgPool2d(1),                    # Already in inception_v3 output
                 nn.Linear(2048, 2048), nn.ReLU(),
-                nn.Dropout(p=.5),                           # Moved here from inception_v3 output
+                nn.Dropout(p=.5),                           # Moved - here from inception_v3 output
                 nn.Linear(2048, len(self.ds_t.part_list)),
                 nn.Sigmoid(),                               # Included in nn.BCEWithLogitsLoss()
             );  self.detector.to(self.device)
 
-            self.optimizer_d = torch.optim.Adam(self.detector.parameters())
+            self.optimizer_d = torch.optim.Adam(self.detector.fc.parameters())
             self.scheduler_d = None
-        else:  # TODO - take into account which output layer to overwrite (depending on backbone)
+            last_layer = self.detector.fc[-1]
+        else:
             # Based on: https://github.com/JulesSanchez/X-NeSyL
             self.detector = backbone if backbone else models.resnet50(pretrained=True)
-            self.detector.fc = nn.Sequential(
-                nn.Linear(2048, len(self.ds_t.part_list)),
-                nn.Sigmoid(),                               # Included in nn.BCEWithLogitsLoss()
-            );  self.detector.to(self.device)
+            last_layer = replace_last_layer(self.detector, len(self.ds_t.part_list))
+            self.detector.to(self.device)
 
-            self.optimizer_d = torch.optim.SGD(self.detector.parameters(), lr=.0003, momentum=.9)
+            self.optimizer_d = torch.optim.SGD(last_layer.parameters(), lr=.0003, momentum=.9)
             self.scheduler_d = torch.optim.lr_scheduler.StepLR(self.optimizer_d, 9, gamma=.1, last_epoch=-1)
-        if not isinstance(self.detector.fc[-1], nn.Sigmoid):
-            self.criterion_d = nn.BCEWithLogitsLoss(reduction='none')
-        else:
+            last_layer = last_layer[-1]
+        if isinstance(last_layer, nn.Sigmoid):
             self.criterion_d = nn.BCELoss(reduction='none')
-
+        else:
+            self.criterion_d = nn.BCEWithLogitsLoss(reduction='none')
         self.detection_threshold = torch.tensor([.5]).to(self.device)
         if box_convert == 'box':
             def box_scores_to_array(x: list[dict], dataset=train_data):
@@ -128,19 +155,23 @@ class ExplanetModel(nn.Module):
             nn.Linear(classifier_neurons, len(data.dataset.class_list)), nn.Softmax(dim=-1)
         );  self.classifier.to(self.device)
         optimizer_c = torch.optim.Adam(self.classifier.parameters())
-        samples = data.dataset[np.random.choice(int(len(data.dataset)), int(.1*len(data.dataset)), False)][1][1]
-        criterion_c = ShapBackLoss(data.dataset, samples, self.classifier, self.device)
+        criterion_c = nn.CrossEntropyLoss()
 
         self.detector.eval()
         self.classifier.train()
         shap_ged, loss_ct, acc_ct = 0., 0., 0.
         shap_coeffs = []
+        # print('c\033[s', end='')
+        print()
         for ep in range(epochs_c):
+            # print(f'\033[u{ep}', end='')
+            print(f'\rc{ep}', end='')
             loss_ct = 0.
             for imgs_t, (targets_t, parts_t, clases_t) in data:
                 optimizer_c.zero_grad()
 
-                input_ct = self.detect_convert(self.detector(imgs_t).detach())
+                with torch.no_grad():
+                    input_ct = self.detect_convert(self.detector(imgs_t))
                 output_ct = self.classifier(input_ct)
 
                 loss_c = criterion_c(output_ct, clases_t)
@@ -153,10 +184,18 @@ class ExplanetModel(nn.Module):
                     sc, ged = criterion_c.shap_coefficient(output_ct, clases_t, input_ct)
                     shap_coeffs.append(sc)
                     shap_ged += sum(ged)
+            if ep == epochs_c - 2:
+                num_samples = min(max(5, int(.3 * len(data.dataset))), 300)
+                samples = data.dataset[np.random.choice(int(len(data.dataset)), num_samples, False)][1][1]
+                criterion_c = ShapBackLoss(data.dataset, samples, self.classifier, self.device)
 
         self.detector.train()
         num_t, loss_dt, acc_dt = 0, 0., 0.
+        # print(' d\033[s', end='')
+        print()
         for bn, (imgs_t, (targets_t, parts_t, clases_t)) in enumerate(data):
+            # print(f'\033[u{bn}', end='')
+            print(f'\rd{bn}', end='')
             num_t += len(targets_t)
             self.optimizer_d.zero_grad()
 
@@ -178,6 +217,8 @@ class ExplanetModel(nn.Module):
         self.history['shap_ged'].append(shap_ged/num_t)
 
         self.eval()
+        # print(' e ', end='')
+        print()
         num_v, ged_v, acc_dv, acc_cv, loss_dv, loss_cv = 0, 0., 0., 0., 0., 0.
         with torch.no_grad():
             for imgs_v, (targets_v, parts_v, clases_v) in valid:
@@ -199,13 +240,14 @@ class ExplanetModel(nn.Module):
         self.history['loss_cv'].append(loss_cv/num_v)
 
     def train_one_epoch_box(self, data, valid, epochs_c=25, classifier_neurons=11):
+        data.dataset.count = True
+        valid.dataset.count = True
         self.classifier = nn.Sequential(
             nn.Linear(len(data.dataset.part_list), classifier_neurons), nn.ReLU(),
             # nn.Linear(classifier_neurons, classifier_neurons), nn.ReLU(),
             nn.Linear(classifier_neurons, len(data.dataset.class_list)), nn.Softmax(dim=-1)
         );  self.classifier.to(self.device)
         optimizer_c = torch.optim.Adam(self.classifier.parameters())
-        samples = data.dataset[np.random.choice(int(len(data.dataset)), min(int(.3*len(data.dataset)), 200), False)][1][1]
         criterion_c = nn.CrossEntropyLoss()
 
         self.detector.eval()
@@ -215,9 +257,11 @@ class ExplanetModel(nn.Module):
         for ep in range(epochs_c):
             loss_ct = 0.
             for imgs_t, (targets_t, parts_t, clases_t) in data:
+                if not len(targets_t):
+                    continue
                 optimizer_c.zero_grad()
-
-                input_ct = self.detect_convert(self.detector([imgs_t]))
+                with torch.no_grad():
+                    input_ct = self.detect_convert(self.detector([torch.squeeze(imgs_t)]))
                 output_ct = self.classifier(input_ct)
 
                 loss_c = criterion_c(output_ct, clases_t.view(-1))
@@ -231,19 +275,25 @@ class ExplanetModel(nn.Module):
                     shap_coeffs.append(sc)
                     shap_ged += sum(ged)
             if ep == epochs_c - 2:
+                num_samples = min(max(5, int(.3 * len(data.dataset))), 200)
+                samples = data.dataset[np.random.choice(int(len(data.dataset)), num_samples, False)][1][1]
                 criterion_c = ShapBackLoss(data.dataset, samples, self.classifier, self.device)
 
         num_t, loss_dt, acc_dt = 0, 0., 0.
         for bn, (imgs_t, (targets_t, parts_t, clases_t)) in enumerate(data):
+            if not len(targets_t):
+                continue
             num_t += len(targets_t)
             self.optimizer_d.zero_grad()
             self.detector.train()
-            loss_d = self.detector([imgs_t], targets_t)
-            loss_d = sum(l for l in loss_d.values())*shap_coeffs[bn]
+            loss_d = self.detector([torch.squeeze(imgs_t)], targets_t)
 
             self.detector.eval()
-            output_dt = self.detect_convert(self.detector([imgs_t]))
-            acc_dt += torch.sum(binary_accuracy(output_dt, parts_t, self.detection_threshold)).item()
+            with torch.no_grad():
+                output_dt = self.detect_convert(self.detector([torch.squeeze(imgs_t)]))
+                acc_dt += torch.sum(binary_accuracy(output_dt, parts_t, self.detection_threshold)).item()
+            loss_d = sum(l for l in loss_d.values())
+            # assert not torch.isnan(loss_d)
 
             loss_d.backward()
             self.optimizer_d.step()
@@ -258,18 +308,22 @@ class ExplanetModel(nn.Module):
         num_v, ged_v, acc_dv, acc_cv, loss_dv, loss_cv = 0, 0., 0., 0., 0., 0.
         with torch.no_grad():
             for imgs_v, (targets_v, parts_v, clases_v) in valid:
+                if not len(targets_v):
+                    continue
                 num_v += len(targets_v)
                 self.detector.eval()
-                output_dv = self.detector([imgs_v])
-                input_cv = self.detect_convert(output_dv)
-                output_cv = self.classifier(input_cv)
+                output_dv = self.detect_convert(self.detector([torch.squeeze(imgs_v)]))
+                output_cv = self.classifier(output_dv)
                 self.detector.train()
-                loss_d = self.detector([imgs_v])
+                loss_d = self.detector([torch.squeeze(imgs_v)], targets_v)
                 # sc, ged = criterion_c.shap_coefficient(output_cv, clases_v, input_cv)
-                loss_dv += len(targets_v)*sum(l for l in loss_d.values()).item()
+                loss_d = sum(l for l in loss_d.values())
+                # assert not torch.isnan(loss_d)
+
+                loss_dv += len(targets_v)*loss_d.item()
                 acc_dv += torch.sum(binary_accuracy(output_dv, parts_v, self.detection_threshold)).item()
                 # ged_v += sum(ged)
-                loss_cv += criterion_c(output_cv, clases_v).item()*len(targets_v)
+                loss_cv += criterion_c(output_cv, clases_v.view(-1)).item()*len(targets_v)
                 acc_cv += torch.sum(categorical_accuracy(output_cv, clases_v)).item()
         # self.history['shap_ged_v'].append(ged_v/num_v)
         self.history['bin_acc_v'].append(acc_dv/num_v)
@@ -285,21 +339,23 @@ class ExplanetModel(nn.Module):
         print(f'[DATE] {time.strftime("%Y-%b-%d %H:%M:%S", time.localtime())}')
         print(f'[INFO] training EXPLANet ...\nEpoch {0:03d}/{epochs:03d}', end='')
 
+        neurons = len(self.ds_t.class_list)*3 - 1
         best_score, counter = np.inf, 0  # early_stopping
         for ep in range(epochs):
             if bboxes:
-                self.train_one_epoch_box(t_data, v_data)
+                self.train_one_epoch_box(t_data, v_data, classifier_neurons=neurons)
             else:
-                self.train_one_epoch(t_data, v_data)
+                self.train_one_epoch(t_data, v_data, classifier_neurons=neurons)
             if self.scheduler_d:
                 self.scheduler_d.step()
             print(f'\nEpoch {ep + 1:03d}/{epochs:03d}'
-                  f' (bin_acc = {self.history["bin_acc"][-1]:.5f}|{self.history["bin_acc_v"][-1]:.5f}'
-                  f', cat_acc = {self.history["cat_acc"][-1]:.5f}|{self.history["cat_acc_v"][-1]:.5f}'
-                  f', shap_ged = {self.history["shap_ged"][-1]:.5f})', end='')
+                  f' (bin_acc={self.history["bin_acc"][-1]:.5f}|{self.history["bin_acc_v"][-1]:.5f}'
+                  f', cat_acc={self.history["cat_acc"][-1]:.5f}|{self.history["cat_acc_v"][-1]:.5f}'
+                  f', loss_dv={self.history["loss_dv"][-1]:.5f}, shap_ged={self.history["shap_ged"][-1]:.5f})', end='')
             score = self.history['loss_dv'][-1]
             if score > best_score + delta:
                 counter += 1
+                print(' [p]', end='')
                 if counter >= patience:
                     break  # early stop
             else:
@@ -385,14 +441,17 @@ def main():
     np.random.seed(621)
     torch.manual_seed(621)
 
+    # Set up
     os.makedirs(f'{SAVE_DIR}/code', exist_ok=True)
     root_dir, file_name = os.path.split(os.path.realpath(__file__))
     code, lib, utils = os.path.join(root_dir, file_name), os.path.join(root_dir, 'lib'), os.path.join(root_dir, 'utils')
     os.system(f'cp -r {code} {lib} {utils} {SAVE_DIR}/code')
 
-    for db in ['FFoCat_tiny', 'MonuMAI', 'PASCAL', 'FFoCat'][:]:  # FFoCat _reduced _tiny MonuMAI PASCAL
-        for backbone in [models.inception_v3(pretrained=True), models.detection.fasterrcnn_resnet50_fpn(True),
-                         models.resnet50(pretrained=True), models.mobilenet_v2(pretrained=True)][1::-1]:
+    # Execution
+    for backbone in [models.inception_v3, models.resnet50, models.mobilenet_v2,
+                     models.detection.fasterrcnn_resnet50_fpn]:
+        for db in ['MonuMAI', 'PASCAL', 'FFoCat']:  # FFoCat _reduced _tiny MonuMAI PASCAL
+            backbone = backbone(pretrained=True)
             use_boxes = isinstance(backbone, models.detection.FasterRCNN)
             if use_boxes and 'FFoCat' in db:
                 continue
@@ -406,10 +465,10 @@ def main():
             else:
                 box_convert = 'detections'  # TODO - try others
             name_id = f'{db}_{backbone.__class__.__name__}{"_box" * use_boxes}'
-            print(f'[INFO] {db} {backbone.__class__.__name__}')
+            print(f'[INFO] now running {db} {backbone.__class__.__name__}')
 
             model = ExplanetModel(data_train, data_valid, backbone=backbone, box_convert=box_convert)
-            hist = model.train_model(epochs=5 if 'tiny' in db else 50, batch_size=16, bboxes=use_boxes)
+            hist = model.train_model(epochs=3 if '_t' in db else 50, batch_size=64, bboxes=use_boxes)
             model.save_checkpoint(SAVE_DIR, name_id)
 
             with open(f'{SAVE_DIR}/hist_{name_id}.pkl', 'wb') as pickle_file:
@@ -421,11 +480,14 @@ def main():
                 plt.figure()
                 for k, v in hist.items():
                     if topic in k:
-                        plt.plot(v, label=k)  # print(k, '\n', v)
+                        plt.plot(v, label=k)
+                        # print(k, '\n', v)
                 plt.legend()
                 plt.savefig(f'{SAVE_DIR}/{n}_{name_id}.pdf')
                 plt.show()
-    # exit(0)
+
+    # Clean up
+    os.system(f'rm {SAVE_DIR}/*_tmp.pth')
 
 
 NOTEBOOK = False and torch.cuda.is_available()

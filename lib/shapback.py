@@ -83,11 +83,11 @@ def shap_graph_edit_distances(features, shap_values, dataset: ShapImageDataset, 
     for i in range(len(shap_array)):
         shap_graph = {}
         feats = features[i]
-        feats2 = feats + (feats == 0.)  # bug in original code - was always False
+        feats_too = feats + (feats == 0.)
         for k in range(shap_array.shape[-1]):
-            facade = shap_array[i, :, k]*feats2
+            facade = shap_array[i, :, k]*feats_too
             for j, f in enumerate(feats > 0.):  # Always all positive or 0
-                if not f:  # bug in original code - was always False
+                if not f:  # TODO - bug in original code - was always False (changes the results a lot)
                     continue
                 clas, part = f'c{k}', f'p{j}'
                 # XOR - /either/ feat*shap  > threshold   when   feats is /not/  > 0
@@ -114,6 +114,9 @@ class ShapBackLoss(nn.CrossEntropyLoss):
         self.explainer = shap.DeepExplainer(classificator, data_train)
         # TODO - Solve errors with shap.KernelExplainer (May be TF2 exclusive)
         self.knowledge = kg_from_dict(dataset.cmap, dataset.part_list)
+
+    def train_classifier(self):  # TODO - Move classifier training to here
+        raise NotImplementedError()
 
     def compare_shap_and_kg(self, shap_values, true_labels, threshold=0.):
         """Computes misattribution.
@@ -163,7 +166,7 @@ def test():
         nn.Linear(in_features=len(data_train.part_list), out_features=11), nn.ReLU(),
         nn.Linear(in_features=11, out_features=len(data_train.class_list)),  # nn.Softmax(dim=-1),
     );  model.to(dev)
-    loss = ShapBackLoss(dataset=data_train, data_train=data_train[:16][1][0],
+    loss = ShapBackLoss(dataset=data_train, data_train=data_train[:16][1][1],
                         classificator=model, device=dev)
     opt = torch.optim.Adam(model.parameters())
 
