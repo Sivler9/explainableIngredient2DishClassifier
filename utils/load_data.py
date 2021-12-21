@@ -13,7 +13,7 @@ from PIL import Image
 from torch.utils.data import Dataset
 from albumentations.pytorch.transforms import ToTensorV2 as ToTensor
 
-from sklearn.preprocessing import MultiLabelBinarizer
+# from sklearn.preprocessing import MultiLabelBinarizer
 
 NOTEBOOK = False  # ('Data/FFoCat_reduced' if NOTEBOOK else 'Data/FFoCat_tiny')
 
@@ -108,6 +108,7 @@ class ShapImageDataset(Dataset):
         self.device, self.name = device, name
         self.count = False  # TODO - Use count
         # MultiLabelBinarizer(classes=self.part_list)  # Does not count how many of each part
+        self._indices = self.df.index.unique()
 
     def part_label_count(self, label_nums):
         count = [0.]*len(self.part_list)
@@ -121,7 +122,7 @@ class ShapImageDataset(Dataset):
 
     def __len__(self):
         # self.df.index[-1] + 1
-        return self.df.index.unique().__len__()
+        return self._indices.__len__()
 
     def __getitem__(self, idx):
         if torch.is_tensor(idx):
@@ -141,10 +142,9 @@ class ShapImageDataset(Dataset):
             self.tf.is_check_args = False
             self.tf.processors = {}
 
-        indices = self.df.index.unique()
         images, targets, clases, parts = [], [], [], []
         for i in idx:
-            df_local = self.df.loc[[indices[i]]]
+            df_local = self.df.loc[[self._indices[i]]]
             imgf = df_local.loc[:, ['img']].values[0, 0]
             prts = df_local.loc[:, 'part'].values.tolist()
             clas = df_local.loc[:, ['class']].values[0, 0]
@@ -159,8 +159,8 @@ class ShapImageDataset(Dataset):
                 if any(torch.le(area, 0.)):
                     breakpoint()
             else:
-                boxs = torch.zeros((0, 4), dtype=torch.float32)
-                area = torch.zeros(0, dtype=torch.float32)
+                boxs = torch.zeros((0, 4), dtype=torch.float32, device=self.device)
+                area = torch.zeros(0, dtype=torch.float32, device=self.device)
 
             prts = [self.part_list.index(p) for p in prts]
             targets.append({

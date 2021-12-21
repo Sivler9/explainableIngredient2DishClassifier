@@ -3,7 +3,6 @@ TODO - docs and type hints
 """
 import numpy as np
 
-import shap
 import torch
 import torch.nn as nn
 
@@ -12,22 +11,10 @@ from torch.utils.data import DataLoader
 
 from utils.load_data import ShapImageDataset
 
-
-def reduce_shap(contrib, h=1, exp=False, device=torch.device('cpu')):
-    """Apply the max function
-    TODO - docs
-    :param contrib:
-    :param h:
-    :param exp:
-    :param device:
-    :return:
-    """
-    shap_coeff_s = -h*np.min(contrib, axis=1)
-    if exp:  # exponential
-        shap_coeff_s = np.exp(shap_coeff_s)
-    else:  # lineal instance
-        shap_coeff_s = 1 + shap_coeff_s
-    return torch.tensor(shap_coeff_s, requires_grad=False, dtype=torch.float, device=device)
+import warnings
+with warnings.catch_warnings():  # (record=True) as w:
+    warnings.simplefilter('ignore')
+    import shap
 
 
 def kg_from_dict(dic_s, feat=None):
@@ -57,10 +44,10 @@ def shap_graph_edit_distances(features, shap_values, dataset: ShapImageDataset, 
     :param threshold:
     :return:
     """
-    def build_kg(dictionary):
+    def build_kg(dictionary, classes, parts):
         graph = {}
         for k, v in dictionary.items():
-            k, v = f'c{clases.index(k)}', set([f'p{parts.index(n)}' for n in v])
+            k, v = f'c{classes.index(k)}', set([f'p{parts.index(n)}' for n in v])
             graph[k] = v
             for n in v:
                 if n not in graph:
@@ -71,13 +58,14 @@ def shap_graph_edit_distances(features, shap_values, dataset: ShapImageDataset, 
 
     def filtered_edit_distance(expert, sag):  # div 2 - because graph is not directed
         sag_k = expert.keys() & sag.keys()  # == sag.keys() (ideally, anyways)
-        return sum([len((expert[n] ^ sag[n]) & sag_k) for n in sag_k])/2.
+        dist = sum([len((expert[n] ^ sag[n]) & sag_k) for n in sag_k])/2.
+        assert int(dist) == dist
+        return dist
 
-    KG, parts, clases = dataset.cmap, dataset.part_list, dataset.class_list
+    expert_graph = build_kg(dataset.cmap, dataset.class_list, dataset.part_list)
     features = features.detach().cpu().numpy()
     shap_array = np.dstack(shap_values)
     features[features < .5] = 0.
-    expert_graph = build_kg(KG)
 
     d_tot = []
     for i in range(len(shap_array)):
@@ -105,41 +93,61 @@ def shap_graph_edit_distances(features, shap_values, dataset: ShapImageDataset, 
     return d_tot  # float(d_tot) / shap_array.shape[0]
 
 
+def compare_shap_and_kg(knowledge, shap_values, true_labels, threshold=0.):
+    """Computes misattribution.
+    TODO - docs
+    :param shap_values:
+    :param true_labels:
+    :param features:
+    :param threshold:
+    :return:
+    """
+    contrib = np.zeros(shap_values[0].shape)  # (len(true_labels), len(features))
+    for k, tl in enumerate(true_labels.view(-1, 1)):
+        local_kg = knowledge[:, tl]
+        contrib[k] = shap_values[tl][k] * local_kg
+    contrib[contrib > -threshold] = 0.
+    return contrib
+
+
+def reduce_shap(contrib, h=1, exp=False, device=torch.device('cpu')):
+    """Apply the max function
+    TODO - docs
+    :param contrib:
+    :param h:
+    :param exp:
+    :param device:
+    :return:
+    """
+    shap_coeff_s = -h*np.min(contrib, axis=1)
+    if exp:  # exponential
+        shap_coeff_s = np.exp(shap_coeff_s)
+    else:  # lineal instance
+        shap_coeff_s = 1 + shap_coeff_s
+    return torch.tensor(shap_coeff_s, requires_grad=False, dtype=torch.float, device=device)
+
+
 class ShapBackLoss(nn.CrossEntropyLoss):
     """TODO - docs"""
 
     def __init__(self, dataset: ShapImageDataset, data_train, classificator, device=torch.device('cpu')):
         super(ShapBackLoss, self).__init__()  # (reduction='none')  # self.reduction =
         self.dataset, self.device = dataset, device
-        self.explainer = shap.DeepExplainer(classificator, data_train)
+        self.explainer = shap.DeepExplainer(classificator, data_train.to(device))
         # TODO - Solve errors with shap.KernelExplainer (May be TF2 exclusive)
         self.knowledge = kg_from_dict(dataset.cmap, dataset.part_list)
 
     def train_classifier(self):  # TODO - Move classifier training to here
         raise NotImplementedError()
 
-    def compare_shap_and_kg(self, shap_values, true_labels, threshold=0.):
-        """Computes misattribution.
-        TODO - docs
-        :param shap_values:
-        :param true_labels:
-        :param features:
-        :param threshold:
-        :return:
-        """
-        contrib = np.zeros(shap_values[0].shape)  # (len(true_labels), len(features))
-        for k, tl in enumerate(true_labels.view(-1, 1)):
-            local_kg = self.knowledge[:, tl]
-            contrib[k] = shap_values[tl][k] * local_kg
-        contrib[contrib > -threshold] = 0.
-        return contrib
-
     def shap_coefficient(self, y_pred: Tensor, target: Tensor, elems: Tensor = None):
         target, elems = target.long(), elems.float()
         # SHAP
-        if elems is not None and torch.is_grad_enabled():
-            shap_values = self.explainer.shap_values(elems)  # needs grad_enabled, it seems
-            shap_contrib = self.compare_shap_and_kg(shap_values, target, threshold=.0)
+        if elems is not None:  # and torch.is_grad_enabled():
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                shap_values = self.explainer.shap_values(elems)  # needs grad_enabled, it seems
+            shap_contrib = compare_shap_and_kg(self.knowledge, shap_values, target, threshold=.0)
             shap_coeff = reduce_shap(shap_contrib, device=self.device)
             ged = shap_graph_edit_distances(elems, shap_values, self.dataset, threshold=.001)
         else:
