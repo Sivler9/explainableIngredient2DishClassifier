@@ -1,106 +1,76 @@
 """
 TODO - docs and type hints
 """
-import numpy as np
 
 import torch
+import numpy as np
 import torch.nn as nn
 
+from tqdm import trange
 from torch import Tensor
 from torch.utils.data import DataLoader
 
-from utils.load_data import ShapImageDataset
+from .utils.metrics import categorical_accuracy
+from .utils.knowledge_graph import kg_matrix, kg_build
+from .utils.load_data import ShapImageDataset, move_to_device
 
 import warnings
 with warnings.catch_warnings():  # (record=True) as w:
-    warnings.simplefilter('ignore')
+    warnings.simplefilter('ignore', UserWarning)  # IPython
     import shap
 
 
-def kg_from_dict(dic_s, feat=None):
-    """
-    Create knowledge graph from class map
+def compute_sag(feature_vector, shap_values, dataset, threshold=.5):
+    sag = {}
+    for k, c in enumerate(dataset.class_list):
+        local_shap = shap_values[:, k]
+        sag[c] = set()
+        for j, p in enumerate(dataset.part_list):
+            shap_val = local_shap[j]
+            if feature_vector[j] > threshold:
+                if shap_val > .0:
+                    sag[c].add(p)
+            elif shap_val < .0:
+                sag[c].add(p)
+    return kg_build(sag, dataset.class_list, dataset.part_list)
 
-    :param dict dic_s: Class tp feature map
-    :param list feat: Pre-computed features list
-    :returns np.ndarray: Knowledge Graph
-    """
-    if feat is None:
-        feat = sorted(set([el for sty in dic_s.values() for el in sty]))
-    knowledge_graph = -np.ones((len(feat), len(dic_s)), dtype=np.uint8)
-    for i, local_el in enumerate(feat):
-        for k, sty in enumerate(sorted(dic_s.keys())):
-            if local_el in dic_s[sty]:
-                knowledge_graph[i, k] = 1
-    return knowledge_graph
+
+def filtered_edit_distance(expert: dict, sag: dict):  # div 2 - because graph is not directed
+    sag_k = expert.keys() & sag.keys()  # == sag.keys() (ideally, anyways)
+    dist = sum([len((expert[n] ^ sag[n]) & sag_k) for n in sag_k])/2.
+    assert int(dist) == dist
+    return dist
 
 
 def shap_graph_edit_distances(features, shap_values, dataset: ShapImageDataset, threshold=0.001):
     """Fully compute the GED, given feature vectors and shap values. Build KG, build SAG and compute GED
     TODO - docs
-    :param features:
-    :param shap_values:
-    :param dataset:
-    :param threshold:
-    :return:
+    :param torch.Tensor features:
+    :param np.ndarray shap_values:
+    :param ShapImageDataset dataset:
+    :param float threshold:
+    :returns list:
     """
-    def build_kg(dictionary, classes, parts):
-        graph = {}
-        for k, v in dictionary.items():
-            k, v = f'c{classes.index(k)}', set([f'p{parts.index(n)}' for n in v])
-            graph[k] = v
-            for n in v:
-                if n not in graph:
-                    graph[n] = {k}
-                else:
-                    graph[n].add(k)
-        return graph
-
-    def filtered_edit_distance(expert, sag):  # div 2 - because graph is not directed
-        sag_k = expert.keys() & sag.keys()  # == sag.keys() (ideally, anyways)
-        dist = sum([len((expert[n] ^ sag[n]) & sag_k) for n in sag_k])/2.
-        assert int(dist) == dist
-        return dist
-
-    expert_graph = build_kg(dataset.cmap, dataset.class_list, dataset.part_list)
+    expert_graph = kg_build(dataset.cmap, dataset.class_list, dataset.part_list)
     features = features.detach().cpu().numpy()
     shap_array = np.dstack(shap_values)
-    features[features < .5] = 0.
+    features[features < threshold] = 0.
 
     d_tot = []
     for i in range(len(shap_array)):
-        shap_graph = {}
-        feats = features[i]
-        feats_too = feats + (feats == 0.)
-        for k in range(shap_array.shape[-1]):
-            facade = shap_array[i, :, k]*feats_too
-            for j, f in enumerate(feats > 0.):  # Always all positive or 0
-                if not f:  # TODO - bug in original code - was always False (changes the results a lot)
-                    continue
-                clas, part = f'c{k}', f'p{j}'
-                # XOR - /either/ feat*shap  > threshold   when   feats is /not/  > 0
-                #          /xor/ feat*shap <= threshold   when   feats is /not/ <= 0
-                if not f ^ (facade[j] > threshold):
-                    if clas not in shap_graph:
-                        shap_graph[clas] = {part}
-                    else:
-                        shap_graph[clas].add(part)
-                    if part not in shap_graph:
-                        shap_graph[part] = {clas}
-                    else:
-                        shap_graph[part].add(clas)
+        shap_graph = compute_sag(features[i], shap_array[i], dataset, threshold=.5)
         d_tot.append(filtered_edit_distance(expert_graph, shap_graph))
     return d_tot  # float(d_tot) / shap_array.shape[0]
 
 
-def compare_shap_and_kg(knowledge, shap_values, true_labels, threshold=0.):
-    """Computes misattribution.
-    TODO - docs
-    :param shap_values:
-    :param true_labels:
-    :param features:
-    :param threshold:
-    :return:
+def compare_shap_and_kg(knowledge: np.ndarray, shap_values: np.ndarray, true_labels: torch.Tensor, threshold=0.):
+    """Computes misattribution
+
+    :param np.ndarray knowledge: Adjacency matrix
+    :param np.ndarray shap_values: Output from shap.shap_values(...)
+    :param torch.Tensor true_labels: Ground truth (sparse)
+    :param float threshold: Minimum value to contibute to graph
+    :returns np.ndarray:
     """
     contrib = np.zeros(shap_values[0].shape)  # (len(true_labels), len(features))
     for k, tl in enumerate(true_labels.view(-1, 1)):
@@ -124,71 +94,134 @@ def reduce_shap(contrib, h=1, exp=False, device=torch.device('cpu')):
         shap_coeff_s = np.exp(shap_coeff_s)
     else:  # lineal instance
         shap_coeff_s = 1 + shap_coeff_s
-    return torch.tensor(shap_coeff_s, requires_grad=False, dtype=torch.float, device=device)
+    return torch.tensor(shap_coeff_s, dtype=torch.float, device=device)  # , requires_grad=False
 
 
-class ShapBackLoss(nn.CrossEntropyLoss):
-    """TODO - docs"""
+class ShapBackLoss(nn.BCEWithLogitsLoss):
+    def __init__(self, data: DataLoader, neurons: int = None, classifier=None,
+                 criterion=None, optimizer=None, scheduler=None, metric=None,
+                 reduction='mean', device=torch.device('cpu')):
+        super(ShapBackLoss, self).__init__(reduction='none')
+        dataset = data.dataset
+        assert isinstance(dataset, ShapImageDataset)
+        self.knowledge = kg_matrix(dataset.cmap, dataset.part_list, dataset.class_list)
+        self.classifier = classifier if classifier is not None else nn.Sequential(
+            nn.Linear(len(dataset.part_list), neurons), nn.ReLU(inplace=True),
+            # Optional (not in original) - mostly does not increase exec time
+            # nn.Linear(neurons, neurons), nn.ReLU(inplace=True),
+            nn.Linear(neurons, len(dataset.class_list)),  # nn.Softmax(dim=-1),
+        ).to(device)
 
-    def __init__(self, dataset: ShapImageDataset, data_train, classificator, device=torch.device('cpu')):
-        super(ShapBackLoss, self).__init__()  # (reduction='none')  # self.reduction =
-        self.dataset, self.device = dataset, device
-        self.explainer = shap.DeepExplainer(classificator, data_train.to(device))
-        # TODO - Solve errors with shap.KernelExplainer (May be TF2 exclusive)
-        self.knowledge = kg_from_dict(dataset.cmap, dataset.part_list)
+        self.criterion = criterion if criterion is not None else nn.CrossEntropyLoss()
+        self.optimizer = optimizer if optimizer is not None else torch.optim.Adam
+        self.metric = metric if metric is not None else categorical_accuracy
+        self.initial_classifier = None
+        self.scheduler = scheduler
+        self.reduce = reduction
+        self.dataset = dataset
+        self.explainer = None
 
-    def train_classifier(self):  # TODO - Move classifier training to here
-        raise NotImplementedError()
+        self.previous_inputs = torch.zeros(len(dataset), len(dataset.part_list), device=device)
+        self.previous_truth = torch.zeros(len(dataset), dtype=torch.long, device=device)
+        self.shap_coeffs = torch.ones(len(dataset), device=device)
+        self.ids = 0
 
-    def shap_coefficient(self, y_pred: Tensor, target: Tensor, elems: Tensor = None):
-        target, elems = target.long(), elems.float()
+        self._init_train(data)
+
+    @property
+    def device(self):
+        return next(self.classifier.parameters()).device
+
+    def to(self, device, *args, **kwargs):  # TODO - Others
+        return self.classifier.to(device, *args, **kwargs)
+
+    def shap_coefficients(self, max_samples=100, input_size=None):
+        if input_size and input_size != self.previous_truth.size(0):
+            elems = self.previous_inputs[:input_size].float()
+            target = self.previous_truth[:input_size].long()
+        else:
+            elems = self.previous_inputs.float()
+            target = self.previous_truth.long()
+        samples = np.random.choice(target.size(0), min(target.size(0)//4, max_samples), False)
         # SHAP
-        if elems is not None:  # and torch.is_grad_enabled():
+        if torch.is_grad_enabled():
+            explainer = shap.DeepExplainer(self.classifier, elems[samples])
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", UserWarning)
-                shap_values = self.explainer.shap_values(elems)  # needs grad_enabled, it seems
-            shap_contrib = compare_shap_and_kg(self.knowledge, shap_values, target, threshold=.0)
-            shap_coeff = reduce_shap(shap_contrib, device=self.device)
+                shap_values = explainer.shap_values(elems)  # needs grad_enabled, it seems
             ged = shap_graph_edit_distances(elems, shap_values, self.dataset, threshold=.001)
+            if shap_values[0].shape[0] == self.previous_truth.size(0):
+                shap_contrib = compare_shap_and_kg(self.knowledge, shap_values, target, threshold=.0)
+                self.shap_coeffs = reduce_shap(shap_contrib, device=self.device).detach()
         else:
-            shap_coeff = torch.ones((len(y_pred),), device=self.device)
-            ged = np.empty((len(y_pred),))
-            ged[:] = np.nan
+            ged = np.zeros_like(self.shap_coeffs)
+            ged[:] = np.nan()
+        return np.mean(ged).item()
 
-        # if self.reduction == 'none': ...
-        # torch.dot(loss, shap_coeff) / len(y_pred), ged
-        # if ged is np.nan else (torch.dot(loss, shap_coeff) / len(y_pred), ged)
-        return shap_coeff, ged
+    def train_epoch(self, optimizer, batch=32, input_size=None):
+        length = self.previous_inputs.size(0) if input_size is None else input_size
+        length, loss, acc = length//batch, 0., 0.
+        for ran in range(length):
+            idx = slice(batch*ran, batch*(ran + 1))
+            inp = self.previous_inputs[idx]
+            tru = self.previous_truth[idx]
+            # Network & Loss output
+            res = self.classifier(inp)
+            tmp_loss = self.criterion(res, tru)
+            # Optimizer
+            optimizer.zero_grad()
+            tmp_loss.backward()
+            optimizer.step()
+            # Log
+            loss += tmp_loss.item()
+            acc += torch.mean(self.metric(res, tru))
+        return loss/length, acc/length
+
+    def step(self, epochs=25, train=True, shap_train=True, input_size=None):
+        self.ids = 0
+        optimizer = self.optimizer(self.classifier.parameters())
+        scheduler = self.sheduler(optimizer) if self.optimizer is not torch.optim.Adam else None
+        if self.initial_classifier:
+            self.classifier.load_state_dict(self.initial_classifier)
+        loss, acc = 0., 0.
+        for ep in trange(epochs if train else 1, desc='Shap Epochs', disable=not train):
+            loss, acc = self.train_epoch(optimizer)
+            if scheduler:
+                scheduler.step()
+        opt = {} if input_size is None else {'input_size': input_size}
+        ged = self.shap_coefficients(**opt) if shap_train else np.nan
+        return {'shap_loss': loss, 'shap_acc': acc, 'shap_ged': ged}
+
+    def _init_train(self, data, epochs=5):
+        for dat in data:
+            imgs, (targets, parts, clases) = move_to_device(dat, device=self.device)
+            self.previous_inputs[[tar['image_id'] for tar in targets], :] = parts
+        self.step(epochs, train=True, shap_train=False)
+        self.initial_classifier = self.classifier.state_dict()
+
+    def forward(self, predicted,  ground_truth, macro_labels: torch.Tensor = None, ids: list = None):  #  -> torch.Tensor:
+        if ids is None:  # TODO - based on batches
+            tmp = self.ids + predicted.size(0)
+            ids = slice(self.ids, tmp)
+            self.ids = tmp
+        self.previous_inputs[ids, :] = predicted.detach()
+        if macro_labels is not None:
+            self.previous_truth[ids] = macro_labels.detach()
+        loss = torch.mean(super(ShapBackLoss, self).forward(predicted, ground_truth), dim=-1)
+        if self.reduce == 'none':
+            return torch.dot(loss, self.shap_coeffs[ids])
+        elif self.reduce == 'split':
+            return loss, self.shap_coeffs[ids]
+        elif self.reduce == 'mean':
+            return torch.mean(torch.dot(loss, self.shap_coeffs[ids]))
+        else:  # self.reduce == 'sum':
+            return torch.sum(torch.dot(loss, self.shap_coeffs[ids]))
 
 
-def test():
-    import os
-    from utils.load_data import get_dataset
-
-    os.chdir('..')
-    torch.manual_seed(621)
-    dev = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-
-    data_train, data_tests = get_dataset('FFoCat_tiny', device=dev)
-    model = nn.Sequential(
-        nn.Linear(in_features=len(data_train.part_list), out_features=11), nn.ReLU(),
-        nn.Linear(in_features=11, out_features=len(data_train.class_list)),  # nn.Softmax(dim=-1),
-    );  model.to(dev)
-    loss = ShapBackLoss(dataset=data_train, data_train=data_train[:16][1][1],
-                        classificator=model, device=dev)
-    opt = torch.optim.Adam(model.parameters())
-
-    train_data = DataLoader(data_train.classify, batch_size=8, shuffle=True)
-    _, (_, X_batch, Y_batch) = next(iter(train_data))
-
-    model.train()
-    print(next(iter(model.parameters())).data[0])
-    yb_pred = model(X_batch)
-    batch_loss = loss(yb_pred, Y_batch, X_batch)
-    batch_loss.backward()
-    opt.step()
-    print(next(iter(model.parameters())).data[0])
+def tests():  # TODO - move tests to their own directory
+    raise NotImplementedError
 
 
 if __name__ == '__main__':
-    test()
+    tests()
+
