@@ -1,5 +1,6 @@
 import gc
 import os
+import sys
 import time
 import random
 import pickle
@@ -22,7 +23,7 @@ from lib.utils.load_data import get_dataset, shap_collate_fn, move_to_device
 from typing import Union
 from lib.utils.load_data import ShapImageDataset
 
-DEBUGGING = __debug__ and False
+DEBUGGING = sys.gettrace() is not None
 SAVE_DIR = f'./results/{int(time.time())}/'
 DEFAULT_DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
@@ -196,12 +197,15 @@ class DetectorWrapper(nn.Module):
 
 
 def save_model(model, path):
+    a = next(model.parameters()).device
     try:
-        torch.save(model, path)
+        torch.save(model.cpu(), path)
     except pickle.PicklingError:
-        del model.eager_outputs
-        torch.save(model, path)
-        model.eager_outputs = eager_outputs
+        b = model.eager_outputs
+        model.eager_outputs = models.detection.generalized_rcnn.GeneralizedRCNN.eager_outputs
+        torch.save(model.cpu(), path)
+        model.eager_outputs = b
+    model.to(a)
 
 
 class EXPLANetTrainer:
@@ -223,17 +227,17 @@ class EXPLANetTrainer:
             ).items()} if hasattr(detector.criteria, 'step') else {}
         self.history.update(dict(train_loss=loss, train_acc=acc, **shap_metrics))
 
-    def valid_epoch(self, detector, valid_data):
+    def valid_epoch(self, detector, valid_data, shap_ged=False):
         loss, acc = 0., 0.
         detector = detector.train() if detector.box else detector.eval()
-        with tqdm(valid_data, desc='Validation Batches', ncols=80) as batches, torch.no_grad():  # TODO - no_grad
+        with tqdm(valid_data, desc='Validation Batches', ncols=80) as batches, torch.no_grad():
             for batch in batches:
                 detector(batch)
                 acc += detector.accuracy()
                 loss += detector.loss().item()
         loss, acc = loss/len(valid_data), acc/len(valid_data)
         shap_metrics = {'valid_' + k: v for k, v in detector.criteria.step(train=False,
-            input_size=len(valid_data.dataset)).items()} if hasattr(detector.criteria, 'step') else {}
+            input_size=len(valid_data.dataset)).items()} if hasattr(detector.criteria, 'step') and shap_ged else {}
         self.history.update(dict(valid_loss=loss, valid_acc=acc, **shap_metrics))
 
     def train_net(self, detector: DetectorWrapper, train_data: DataLoader, valid_data: DataLoader = None,
@@ -254,15 +258,15 @@ class EXPLANetTrainer:
                 epochs_since_best += 1
                 self.valid_epoch(detector, valid_data)
                 if self.history['valid_loss'][-1] < best:
-                    best = self.history['valid_loss'][-1]
-                    save_model(detector.model, os.path.join(SAVE_DIR, 'models', f'{name_id}_d{ep}.mdl'))
-                    save_model(detector.criteria.classifier, os.path.join(SAVE_DIR, 'models', f'{name_id}_c{ep}.mdl'))
                     epochs_since_best = 0
+                    best = self.history['valid_loss'][-1]
+                    save_model(detector.model, os.path.join(SAVE_DIR, 'models', f'{name_id}_d{ep}.pth'))
+                    save_model(detector.criteria.classifier, os.path.join(SAVE_DIR, 'models', f'{name_id}_c{ep}.pth'))
                 valid_1, valid_2 = f'|{self.history["valid_acc"][-1]:.5f}', f'|{self.history["valid_loss"][-1]:.5f}'
             if 'train_shap_acc' in self.history.log:
                 shap_1 = f', cat_acc={self.history["train_shap_acc"][-1]:.5f}'
                 shap_2 = f', shap_ged={self.history["train_shap_ged"][-1]:.5f}'
-                if valid_data:
+                if 'valid_shap_acc' in self.history.log:
                     shap_1 += f'|{self.history["valid_shap_acc"][-1]:.5f}'
                     shap_2 += f'|{self.history["valid_shap_ged"][-1]:.5f}'
             if verbose:
@@ -292,15 +296,14 @@ def main():  # TODO - verbose for training tqdm
         os.path.join(root_dir, 'lib', 'utils')
 
     # Define combinations
-    databases = ['MonuMAI', 'FFoCat', 'PASCAL']
+    databases = ['MonuMAI', 'FFoCat', 'PASCAL']  # (*_test) (FFoCat_reduced, FFoCat_tiny)
     backbones = [models.resnet50, models.mobilenet_v2, models.inception_v3, models.detection.fasterrcnn_resnet50_fpn]
 
     if DEBUGGING:
-        databases, backbones = databases[:1], backbones[:1]
         os.system(f'cp -r {code} {lib} {utils} {SAVE_DIR}/code')
 
     # Execution
-    for db in databases:  # [,'FFoCat', 'MonuMAI', 'PASCAL']  # (*_test) (FFoCat_reduced, FFoCat_tiny)
+    for db in databases:
         for back in backbones:
             # Prepare model and data
             backbone = back(pretrained=True)  # aux_logits=False
@@ -308,22 +311,16 @@ def main():  # TODO - verbose for training tqdm
                 continue  # FFoCat does not have boxes
             name_id = f'{db}_{back.__name__}'  # backbone.__class__.__name__
             img_size = 299 if isinstance(backbone, models.Inception3) else 224
+            dbs, batch_size, workers, pre_epochs, epochs = db, (8 if hasattr(backbone, 'roi_heads') else 32), 4, 5, 50
             if DEBUGGING:
-                dbs = db + '_test'
-                batch_size, workers, pre_epochs, epochs = 64, 0, 2, 2
-            else:
-                dbs = db
-                batch_size, workers, pre_epochs, epochs = 32, 4, 5, 50
+                dbs, batch_size, workers, pre_epochs, epochs = db + '_test', 8, 0, 2, 2
             data_train, data_valid = get_dataset(dbs, size=img_size, device=torch.device('cpu'))
             adjust_output_size(backbone, len(data_train.part_list))  # Can't do num_classes if pretrained
 
             # Prepare training
-            if hasattr(backbone, 'roi_heads'):
-                batch_size = 8
-            t_data = DataLoader(data_train, batch_size=batch_size, collate_fn=shap_collate_fn, shuffle=True,
-                                num_workers=workers, pin_memory=True)  # , worker_init_fn=lambda x: breakpoint()
-            v_data = DataLoader(data_valid, batch_size=batch_size, collate_fn=shap_collate_fn,
-                                num_workers=workers, pin_memory=True)
+            data_opt = dict(batch_size=batch_size, collate_fn=shap_collate_fn, num_workers=workers, pin_memory=True)
+            t_data = DataLoader(data_train, **data_opt, shuffle=True)  # , worker_init_fn=lambda x: breakpoint())
+            v_data = DataLoader(data_valid, **data_opt)
             detector = DetectorWrapper(backbone, data_train, criterion=nn.BCEWithLogitsLoss()).to(DEFAULT_DEVICE)
 
             # Run training
@@ -337,6 +334,9 @@ def main():  # TODO - verbose for training tqdm
             # Save model and results
             with open(os.path.join(SAVE_DIR, f'hist_{name_id}.pkl'), 'wb+') as pickle_file:
                 pickle.dump(hist, pickle_file)
+
+    import autoenc
+    autoenc.main()
 
 
 if __name__ == '__main__':

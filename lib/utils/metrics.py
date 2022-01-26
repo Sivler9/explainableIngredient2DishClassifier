@@ -17,10 +17,8 @@ class History:
     def update(self, dic: dict):
         length = len(next(iter(self.log.values()))) if self.log else 0
         for key, val in dic.items():
-            if self.log.get(key):
-                self.log[key] = self.log[key] + [val]
-            else:
-                self.log[key] = [*[np.nan]*length, val]
+            val = [val.item() if torch.is_tensor(val) else val]
+            self.log[key] = (self.log[key] if self.log.get(key) else [np.nan]*length) + val
 
     def __getitem__(self, item):
         return self.log.__getitem__(item)

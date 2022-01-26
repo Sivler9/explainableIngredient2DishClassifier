@@ -20,7 +20,17 @@ with warnings.catch_warnings():  # (record=True) as w:
     import shap
 
 
-def compute_sag(feature_vector, shap_values, dataset, threshold=.5):
+def compute_sag(feature_vector, shap_values, dataset, threshold=.1):
+    """Implements 'Algorithm 1' in 'EXplainable Neural-Symbolic Learning (X-NeSyL) methodology to fuse deep learning
+     representations with expert knowledge graphs: the MonuMAI cultural heritage use case'
+     Code from
+
+    :param feature_vector:
+    :param shap_values:
+    :param dataset:
+    :param threshold:
+    :return:
+    """
     sag = {}
     for k, c in enumerate(dataset.class_list):
         local_shap = shap_values[:, k]
@@ -35,14 +45,14 @@ def compute_sag(feature_vector, shap_values, dataset, threshold=.5):
     return kg_build(sag, dataset.class_list, dataset.part_list)
 
 
-def filtered_edit_distance(expert: dict, sag: dict):  # div 2 - because graph is not directed
-    sag_k = expert.keys() & sag.keys()  # == sag.keys() (ideally, anyways)
-    dist = sum([len((expert[n] ^ sag[n]) & sag_k) for n in sag_k])/2.
+def filtered_edit_distance(expert: dict, sag: dict):
+    sag_k = expert.keys() & sag.keys()  # == sag.keys() - ideally, anyways, otherwise there is something really wrong
+    dist = sum([len((expert[n] ^ sag[n]) & sag_k) for n in sag_k])/2.  # div 2 - because graph is not directed
     assert int(dist) == dist
     return dist
 
 
-def shap_graph_edit_distances(features, shap_values, dataset: ShapImageDataset, threshold=0.001):
+def shap_graph_edit_distances(features, shap_values, dataset: ShapImageDataset, threshold=.5):
     """Fully compute the GED, given feature vectors and shap values. Build KG, build SAG and compute GED
     TODO - docs
     :param torch.Tensor features:
@@ -58,7 +68,7 @@ def shap_graph_edit_distances(features, shap_values, dataset: ShapImageDataset, 
 
     d_tot = []
     for i in range(len(shap_array)):
-        shap_graph = compute_sag(features[i], shap_array[i], dataset, threshold=.5)
+        shap_graph = compute_sag(features[i], shap_array[i], dataset)
         d_tot.append(filtered_edit_distance(expert_graph, shap_graph))
     return d_tot  # float(d_tot) / shap_array.shape[0]
 
@@ -94,7 +104,7 @@ def reduce_shap(contrib, h=1, exp=False, device=torch.device('cpu')):
         shap_coeff_s = np.exp(shap_coeff_s)
     else:  # lineal instance
         shap_coeff_s = 1 + shap_coeff_s
-    return torch.tensor(shap_coeff_s, dtype=torch.float, device=device)  # , requires_grad=False
+    return torch.tensor(shap_coeff_s, requires_grad=False, dtype=torch.float, device=device)
 
 
 class ShapBackLoss(nn.BCEWithLogitsLoss):
@@ -104,10 +114,12 @@ class ShapBackLoss(nn.BCEWithLogitsLoss):
         super(ShapBackLoss, self).__init__(reduction='none')
         dataset = data.dataset
         assert isinstance(dataset, ShapImageDataset)
+        if neurons is None:
+            neurons = min(3*len(dataset.class_list) - 1, (len(dataset.class_list) + len(dataset.part_list))//2 + 2)
         self.knowledge = kg_matrix(dataset.cmap, dataset.part_list, dataset.class_list)
         self.classifier = classifier if classifier is not None else nn.Sequential(
             nn.Linear(len(dataset.part_list), neurons), nn.ReLU(inplace=True),
-            # Optional (not in original) - mostly does not increase exec time
+            # Optional (not in original) - does not increase exec time noticeably
             # nn.Linear(neurons, neurons), nn.ReLU(inplace=True),
             nn.Linear(neurons, len(dataset.class_list)),  # nn.Softmax(dim=-1),
         ).to(device)
@@ -135,26 +147,32 @@ class ShapBackLoss(nn.BCEWithLogitsLoss):
     def to(self, device, *args, **kwargs):  # TODO - Others
         return self.classifier.to(device, *args, **kwargs)
 
-    def shap_coefficients(self, max_samples=100, input_size=None):
+    def shap_coefficients(self, max_samples=16, input_size=None):
         if input_size and input_size != self.previous_truth.size(0):
             elems = self.previous_inputs[:input_size].float()
             target = self.previous_truth[:input_size].long()
         else:
             elems = self.previous_inputs.float()
             target = self.previous_truth.long()
-        samples = np.random.choice(target.size(0), min(target.size(0)//4, max_samples), False)
+        num_samples = min(target.size(0), max_samples)
+        if False and target.size(0) < 1000:  # TODO - option
+            samples = elems[np.random.choice(target.size(0), num_samples, False)]
+        else:
+            print('Summarizing dataset with kmeans...', end='\r')
+            samples = torch.tensor(shap.kmeans(elems.cpu(), num_samples).data, dtype=torch.float, device=self.device)
         # SHAP
         if torch.is_grad_enabled():
-            explainer = shap.DeepExplainer(self.classifier, elems[samples])
+            explainer = shap.DeepExplainer(self.classifier, samples)
             with warnings.catch_warnings():
+                print('Getting shap values...', end='\r')
                 warnings.simplefilter("ignore", UserWarning)
                 shap_values = explainer.shap_values(elems)  # needs grad_enabled, it seems
-            ged = shap_graph_edit_distances(elems, shap_values, self.dataset, threshold=.001)
+            ged = shap_graph_edit_distances(elems, shap_values, self.dataset, threshold=.5)
             if shap_values[0].shape[0] == self.previous_truth.size(0):
                 shap_contrib = compare_shap_and_kg(self.knowledge, shap_values, target, threshold=.0)
                 self.shap_coeffs = reduce_shap(shap_contrib, device=self.device).detach()
         else:
-            ged = np.zeros_like(self.shap_coeffs)
+            ged = np.empty_like(self.shap_coeffs)
             ged[:] = np.nan()
         return np.mean(ged).item()
 
